@@ -1899,3 +1899,22 @@ void server_prompt_cache::update() {
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }
+std::string server_task::validate_user_id(std::string user_id) {
+    constexpr size_t MAX_USER_ID_LEN = 512;
+    if (user_id.size() > MAX_USER_ID_LEN) {
+        throw std::invalid_argument(
+            "llama_user_id exceeds maximum length of " + std::to_string(MAX_USER_ID_LEN));
+    }
+    for (char c : user_id) {
+        const bool ok = (c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') ||
+                        c == '-' || c == '_';
+        if (!ok) {
+            throw std::invalid_argument(
+                "llama_user_id must match ^[a-zA-Z0-9\\-_]+$ (empty = anonymous)");
+        }
+    }
+    return user_id;
+}
+>>>>>>> 7043bf197 (server : thread user_id field from request body to server_task)
