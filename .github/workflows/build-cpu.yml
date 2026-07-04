@@ -138,6 +138,17 @@ jobs:
           ./bin/llama-convert-llama2c-to-ggml --copy-vocab-from-model ./tok512.bin --llama2c-model stories260K.bin --llama2c-output-model stories260K.gguf
           ./bin/llama-completion -m stories260K.gguf -p "One day, Lily met a Shoggoth" -n 500 -c 256
 
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-linux-${{ matrix.build }}-cpu.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-linux-${{ matrix.build }}-cpu.zip
+          name: llama-bin-linux-${{ matrix.build }}-cpu.zip
+
   windows:
     name: windows / ${{ matrix.build }}
     runs-on: windows-2025
@@ -151,12 +162,16 @@ jobs:
         include:
           - build: 'x64-cpu-static'
             arch: 'x64'
+            artifact: 'llama-bin-win-llvm-cpu-x64'
             defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DBUILD_SHARED_LIBS=OFF'
           - build: 'x64-openblas'
             arch: 'x64'
+            artifact: 'llama-bin-win-llvm-openblas-x64'
             defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DBLAS_INCLUDE_DIRS="$env:RUNNER_TEMP/openblas/include" -DBLAS_LIBRARIES="$env:RUNNER_TEMP/openblas/lib/openblas.lib"'
+
           - build: 'arm64'
             arch: 'arm64'
+            artifact: 'llama-bin-win-llvm-cpu-arm64'
             defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON'
 
     steps:
@@ -210,6 +225,17 @@ jobs:
         run: |
           cd build
           ctest -L main -C Release --verbose --timeout 900
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl ${{ matrix.artifact }}.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: ${{ matrix.artifact }}.zip
+          name: ${{ matrix.artifact }}.zip
 
       # TODO: disabled for now, consider adding tests for all CPU variants instead
       # - name: Test (Intel SDE)
