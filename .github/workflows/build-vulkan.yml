@@ -140,17 +140,16 @@ jobs:
         run: |
           cd build
           ctest -L main -C Release --verbose --timeout 900
-
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          7z a -snl llama-bin-win-vulkan-x64.zip .\build\bin\Release\*
+          7z a -snl llama-bin-linux-arm64-vulkan.zip ./build/bin/*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-vulkan-x64.zip
-          name: llama-bin-win-vulkan-x64.zip
+          path: llama-bin-linux-arm64-vulkan.zip
+          name: llama-bin-linux-arm64-vulkan.zip
 
   windows-msvc-x64:
     runs-on: windows-2025
@@ -276,6 +275,17 @@ jobs:
           export GGML_VK_DISABLE_F16=1
           export GGML_VK_DISABLE_COOPMAT=1
           ctest -L main --verbose --timeout 900
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-linux-x64-vulkan.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-linux-x64-vulkan.zip
+          name: llama-bin-linux-x64-vulkan.zip
 
   windows:
     runs-on: windows-2025
