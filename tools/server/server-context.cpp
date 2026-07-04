@@ -6364,7 +6364,7 @@ void server_routes::init_routes() {
             params.n_predict,
             meta->slot_n_ctx,
             params.spm_infill,
-            tokenized_prompts[0].get_tokens() // TODO: this could maybe be multimodal.
+            tokenized_prompts[0].get_text_tokens() // text-only tokens: mtmd-safe (get_tokens asserts !has_mtmd)
         );
 
         std::vector<raw_buffer> files; // dummy
