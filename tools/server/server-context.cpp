@@ -2042,7 +2042,10 @@ private:
         // All checkpoints (mid-prompt and deferred) must use the same
         // hash to prevent splitting checkpoints across conversations.
         {
-            const auto & task_tokens = slot.task->tokens.get_tokens();
+            // get_text_tokens (not get_tokens) so multimodal tasks don't abort on
+            // the GGML_ASSERT(!has_mtmd) in get_tokens(); text tokens are a stable
+            // hash basis and identical to get_tokens() for non-multimodal tasks.
+            const auto task_tokens = slot.task->tokens.get_text_tokens();
             size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
             slot.conv_hash = kv_ssd_hash_tokens(
                 (const uint32_t *)task_tokens.data(), hash_len);
@@ -2679,10 +2682,11 @@ private:
         // SSD-backed KV cache: store checkpoint on disk
         if (ssd_page_manager) {
             const auto & prefix_tokens = slot.prompt.tokens;
+            const llama_tokens prefix_text = prefix_tokens.get_text_tokens();
             ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur,
-                prefix_tokens.get_tokens().data(),
-                prefix_tokens.get_tokens().size(),
+                prefix_text.data(),
+                prefix_text.size(),
                 ssd_turn_counter, slot.conv_hash,
                 slot.task ? slot.task->user_id : std::string());
         }
@@ -2734,9 +2738,9 @@ private:
                 (float)cur.size() / 1024 / 1024);
 
         if (ssd_page_manager) {
-            const auto & prefix_tokens = slot.task
-                ? slot.task->tokens.get_tokens()
-                : slot.prompt.tokens.get_tokens();
+            const llama_tokens prefix_tokens = slot.task
+                ? slot.task->tokens.get_text_tokens()
+                : slot.prompt.tokens.get_text_tokens();
             ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
                 prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
@@ -2759,7 +2763,7 @@ private:
             return;
         }
 
-        const auto & tokens = slot.task->tokens.get_tokens();
+        const auto tokens = slot.task->tokens.get_text_tokens();
         if (tokens.empty()) {
             return;
         }
@@ -3017,7 +3021,7 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
+                    const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
                     const int64_t t_end = ggml_time_us();
@@ -3595,8 +3599,10 @@ private:
 
                         // cold start: try per-conversation SSD checkpoint restore
                         // Must populate slot.prompt.tokens so get_common_prefix() finds the match
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager) {
-                            const auto & task_tokens = slot.task->tokens.get_tokens();
+                        // Skip for multimodal: text-token match could restore a checkpoint
+                        // whose KV holds different image embeddings.
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager && !slot.task->tokens.has_mtmd) {
+                            const auto task_tokens = slot.task->tokens.get_text_tokens();
                             if (!task_tokens.empty()) {
                                 int32_t ssd_pos_min = 0, ssd_pos_max = 0;
                                 uint64_t ssd_n_tokens = 0;
@@ -3706,8 +3712,8 @@ private:
                         // Only cold starts (empty slot) need system prompt cache.
                         // Warm slots (n_tokens > 0) already have full context from
                         // the in-memory prompt cache LCP restore or previous turn.
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager) {
-                            const auto & task_tokens = slot.task->tokens.get_tokens();
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager && !slot.task->tokens.has_mtmd) {
+                            const auto task_tokens = slot.task->tokens.get_text_tokens();
                             int n_sys = kv_detect_system_prompt_boundary(
                                 llama_model_get_vocab(llama_get_model(ctx_tgt)),
                                 task_tokens.data(),
@@ -5439,7 +5445,7 @@ void server_routes::init_routes() {
             params.n_predict,
             meta->slot_n_ctx,
             params.spm_infill,
-            tokenized_prompts[0].get_tokens() // TODO: this could maybe be multimodal.
+            tokenized_prompts[0].get_text_tokens() // text-only tokens: mtmd-safe (get_tokens asserts !has_mtmd)
         );
 
         std::vector<raw_buffer> files; // dummy
