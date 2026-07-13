@@ -37,6 +37,9 @@ GGML_SYCL   ?= OFF
 GGML_OPENCL ?= OFF
 GGML_CANN   ?= OFF
 
+# Deployment path for systemd (set to empty to skip auto-deploy)
+DEPLOY_DIR  ?= /opt/cachy-llama/bin
+
 # --- Derived flags ---
 CMAKE_FLAGS = \
 	-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
@@ -58,7 +61,7 @@ YELLOW := \033[33;1m
 CYAN := \033[36;1m
 NC := \033[0m
 
-.PHONY: all sync sync-merge server cli bench quantize perplexity release debug clean rebuild test info
+.PHONY: all sync sync-merge server cli bench quantize perplexity release debug clean rebuild deploy restart test info
 
 # --- Sync with upstream ---
 
@@ -116,6 +119,23 @@ perplexity:
 release:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
 	@$(CMAKE) --build $(BUILD_DIR) --config Release -j $(PARALLEL)
+	@$(MAKE) deploy
+
+deploy:
+ifneq ($(DEPLOY_DIR),)
+	@printf "$(BLUE)⟳ Deploying to $(DEPLOY_DIR)...$(NC)\n"
+	sudo mkdir -p $(DEPLOY_DIR)
+	-sudo systemctl stop llama.cpp 2>/dev/null
+	sleep 1
+	sudo cp -r $(BUILD_DIR)/bin/* $(DEPLOY_DIR)/
+	@printf "$(GREEN)✓ Deployed to $(DEPLOY_DIR)$(NC)\n"
+endif
+
+restart:
+	@printf "$(BLUE)⟳ Restarting llama.cpp service...$(NC)\n"
+	sudo systemctl restart llama.cpp
+	@printf "$(GREEN)✓ llama.cpp restarted$(NC)\n"
+	sudo systemctl status llama.cpp --no-pager -l | head -10
 
 debug:
 	@$(CMAKE) -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_FLAGS)
@@ -164,6 +184,8 @@ info:
 	@printf "  make              Shortcut for 'make release'\n"
 	@printf "  make sync         Fetch upstream + rebase + push + build (default)\n"
 	@printf "  make sync-merge   Fetch upstream + merge + push + build\n"
+	@printf "  make deploy       Copy binaries to $(DEPLOY_DIR)\n"
+	@printf "  make restart      systemctl restart llama.cpp\n"
 	@printf "  make all          Full build\n"
 	@printf "  make server       llama-server only\n"
 	@printf "  make cli          llama-cli only\n"
