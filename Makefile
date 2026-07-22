@@ -39,6 +39,9 @@ GGML_CANN   ?= OFF
 
 # Deployment path for systemd (set to empty to skip auto-deploy)
 DEPLOY_DIR  ?= /opt/cachy-llama/bin
+# Set ENABLE_DEPLOY=1 to automatically copy binaries after a release build.
+# Disabled by default so development builds don't try to sudo/stop services.
+ENABLE_DEPLOY ?= 0
 
 # --- Derived flags ---
 CMAKE_FLAGS = \
@@ -63,6 +66,15 @@ NC := \033[0m
 
 .PHONY: all sync sync-merge server cli bench quantize perplexity release debug clean rebuild deploy restart test info
 
+# --- Opt-in deploy (guarded by ENABLE_DEPLOY=1) ---
+#
+# To enable automatic deploy after every release build:
+#   export ENABLE_DEPLOY=1
+# Or pass it on the command line:
+#   make ENABLE_DEPLOY=1
+#
+# This is opt-in so development builds don't attempt sudo or systemctl.
+
 # --- Sync with upstream ---
 
 sync-merge:
@@ -81,7 +93,7 @@ sync:
 	@printf "$(BLUE)⟳ Rebasing $(BRANCH) onto $(UPSTREAM)/$(BRANCH)...$(NC)\n"
 	git checkout $(BRANCH) && git pull --rebase $(UPSTREAM) $(BRANCH)
 	@printf "$(BLUE)⟳ Pushing to $(ORIGIN)...$(NC)\n"
-	git push $(ORIGIN) $(BRANCH) --force-with-lease
+	git push $(ORIGIN) $(BRANCH) --force-with-lease || { echo; printf "$(YELLOW)⚠ Push rejected. This usually means someone else pushed to $(ORIGIN)/$(BRANCH) while you were rebasing. Try:$(NC)\n"; printf "  git fetch $(ORIGIN) && git rebase $(ORIGIN)/$(BRANCH) && git push $(ORIGIN) $(BRANCH) --force-with-lease\n"; exit 1; }
 	@printf "$(GREEN)✓ $(BRANCH) synced with upstream (clean history)$(NC)\n"
 	@$(MAKE) release
 
@@ -119,7 +131,7 @@ perplexity:
 release:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
 	@$(CMAKE) --build $(BUILD_DIR) --config Release -j $(PARALLEL)
-	@$(MAKE) deploy
+	@if [ "$(ENABLE_DEPLOY)" = "1" ]; then $(MAKE) deploy; fi
 
 deploy:
 ifneq ($(DEPLOY_DIR),)
