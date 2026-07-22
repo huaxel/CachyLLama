@@ -273,6 +273,10 @@ llama_build_and_test(test-ssd-cache-caps.cpp)
 # not just the bounded 4096-token prefix. Normalize overlap by token_count.
 llama_build_and_test(test-ssd-cache-continuation.cpp)
 llama_build_and_test(test-ssd-cache-prefix-match.cpp)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-moe-residency.cpp)
+    target_include_directories(test-moe-residency PRIVATE ${CMAKE_SOURCE_DIR}/src)
+endif()
 llama_build_and_test(test-arg-parser.cpp)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)

@@ -1626,20 +1626,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"-ssd-hot", "--cache-ssd-hot-window"}, "N",
-        string_format("always-keep window size in tokens for SSD cache (default: %zu)", params.cache_ssd_hot_window_tokens),
-        [](common_params & params, int value) {
-            params.cache_ssd_hot_window_tokens = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_SSD_HOT_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"-ssd-warm", "--cache-ssd-warm-window"}, "N",
-        string_format("keep-in-RAM window size in tokens for SSD cache (default: %zu)", params.cache_ssd_warm_window_tokens),
-        [](common_params & params, int value) {
-            params.cache_ssd_warm_window_tokens = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_SSD_WARM_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
         {"-ssd-mc", "--cache-ssd-max-cold"}, "N",
         string_format("max cold tier checkpoints before oldest-first eviction (default: %d, 0=unlimited)", params.cache_ssd_max_cold),
         [](common_params & params, int value) {
@@ -1699,16 +1685,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ssd_system_max_days = value;
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_SYSTEM_MAX_DAYS").set_examples({LLAMA_EXAMPLE_SERVER}));
-   add_opt(common_arg(
-        {"-ssd-ps", "--cache-ssd-page-size"}, "N",
-        string_format("tokens per page for SSD cache: 512, 1024, 2048 (default: %zu)", params.cache_ssd_page_size_tokens),
-        [](common_params & params, int value) {
-            if (value != 512 && value != 1024 && value != 2048) {
-                throw std::invalid_argument("invalid page size, must be 512, 1024, or 2048");
-            }
-            params.cache_ssd_page_size_tokens = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_SSD_PAGE_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-ssd-no-fsync"},
         string_format("skip fsync on SSD checkpoint writes (default: %s)", params.cache_ssd_no_fsync ? "enabled" : "disabled"),

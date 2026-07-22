@@ -30,7 +30,6 @@ struct kv_ssd_config {
     size_t warm_ram_bytes    = 1ULL * 1024 * 1024 * 1024;  // 1 GB warm tier
     int hot_turns            = 2;   // Demote hot->warm after N turns inactive
     int warm_turns           = 4;   // Demote warm->cold after N turns inactive
-    size_t hot_window_tokens = 4096; // Recent tokens always kept hot
     bool auto_size           = true;
     int max_cold_checkpoints = 32;  // Max checkpoints per model (ring buffer cap)
     float memory_reserve     = 0.15f;

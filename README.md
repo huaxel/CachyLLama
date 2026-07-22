@@ -62,10 +62,7 @@ Cold prompt eval rate: 109.9-133.4 t/s. Cached: 15,717/15,721 tokens restored fr
 |------|---------|-------------|
 | `--cache-ssd PATH` | (off) | Enable SSD-backed KV cache |
 | `--cache-ssd-checkpoints N` | 64 | Max checkpoints per slot |
-| `--cache-ssd-hot-window N` | 16384 | Always-keep window in tokens |
-| `--cache-ssd-warm-window N` | 32768 | Keep-in-RAM window in tokens |
 | `--cache-ssd-max-cold N` | 0 | Max cold tier checkpoints (0 = unlimited) |
-| `--cache-ssd-page-size N` | 1024 | Tokens per page (512 / 1024 / 2048) |
 | `--cache-ssd-max-conversations N` | 16 | Max conversation directories |
 | `--cache-ssd-hot-ram N` | auto | Hot tier RAM budget in MiB (0 = auto) |
 | `--cache-ssd-warm-ram N` | auto | Warm tier RAM budget in MiB (0 = auto) |
