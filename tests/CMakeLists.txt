@@ -266,7 +266,17 @@ set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download
 
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
-
+# Regression test for fewtarius/llama-ai issue #6:
+# SSD cache auto-sizing must respect --cache-ssd-hot-ram / --cache-ssd-warm-ram.
+llama_build_and_test(test-ssd-cache-caps.cpp)
+# Continuation matching must consider long (n_tokens > ~4551) checkpoints,
+# not just the bounded 4096-token prefix. Normalize overlap by token_count.
+llama_build_and_test(test-ssd-cache-continuation.cpp)
+llama_build_and_test(test-ssd-cache-prefix-match.cpp)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-moe-residency.cpp)
+    target_include_directories(test-moe-residency PRIVATE ${CMAKE_SOURCE_DIR}/src)
+endif()
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 fewtarius
 // Server Context SSD Cache Integration using kv_ssd_cache
 
-#include "server-context-page-manager.h"
+#include "server-context-ssd-manager.h"
 #include "server-context-ssd-cache.h"
 #include "server-context.h"
 #include "server-task.h"
@@ -29,47 +29,41 @@ static uint64_t fnv1a_string(const std::string & s) {
     return h;
 }
 
-server_context_page_manager::server_context_page_manager(
-    const char* ssd_path,
-    const kv_eviction_config* cfg,
-    size_t /* n_tokens_total */,
-    size_t max_cross_slot_checkpoints
-) : max_cross_slot_checkpoints_(max_cross_slot_checkpoints)
-{
+server_context_ssd_manager::server_context_ssd_manager(const char *          ssd_path,
+                                                         const kv_ssd_config * cfg,
+                                                         size_t /* n_tokens_total */,
+                                                         size_t max_cross_slot_checkpoints) :
+    max_cross_slot_checkpoints_(max_cross_slot_checkpoints) {
     ssd_base_path_ = ssd_path;
     std::error_code ec_fs;
     fs::create_directories(ssd_path, ec_fs);
 
-    kv_ssd_config ssd_cfg;
     if (cfg) {
-        ssd_cfg.hot_ram_bytes = cfg->max_hot_bytes > 0 ? cfg->max_hot_bytes : 2ULL * 1024 * 1024 * 1024;
-        ssd_cfg.warm_ram_bytes = cfg->max_warm_bytes > 0 ? cfg->max_warm_bytes : 1ULL * 1024 * 1024 * 1024;
-        ssd_cfg.hot_window_tokens = cfg->hot_window_tokens;
-        ssd_cfg.hot_turns = cfg->turn_inactivity_threshold > 0 ? cfg->turn_inactivity_threshold : 2;
-        ssd_cfg.warm_turns = cfg->turn_inactivity_threshold > 0 ? cfg->turn_inactivity_threshold * 2 : 4;
-        ssd_cfg.auto_size = cfg->auto_size;
-        ssd_cfg.max_cold_checkpoints = cfg->max_cold_checkpoints;
-        ssd_cfg.memory_reserve = cfg->memory_reserve;
+        config_ = *cfg;
     }
-    if (ssd_cfg.hot_ram_bytes == 0) ssd_cfg.hot_ram_bytes = 2ULL * 1024 * 1024 * 1024;
-    if (ssd_cfg.warm_ram_bytes == 0) ssd_cfg.warm_ram_bytes = 1ULL * 1024 * 1024 * 1024;
-    if (ssd_cfg.hot_turns == 0) ssd_cfg.hot_turns = 2;
-    if (ssd_cfg.warm_turns == 0) ssd_cfg.warm_turns = 4;
-
-    // Store config for creating per-conversation caches later
-    // (save a copy of the config)
-    config_ = ssd_cfg;
+    if (config_.hot_ram_bytes == 0) {
+        config_.hot_ram_bytes = 2ULL * 1024 * 1024 * 1024;
+    }
+    if (config_.warm_ram_bytes == 0) {
+        config_.warm_ram_bytes = 1ULL * 1024 * 1024 * 1024;
+    }
+    if (config_.hot_turns == 0) {
+        config_.hot_turns = 2;
+    }
+    if (config_.warm_turns == 0) {
+        config_.warm_turns = 4;
+    }
 }
 
-void server_context_page_manager::set_no_fsync(bool no_fsync) {
+void server_context_ssd_manager::set_no_fsync(bool no_fsync) {
     config_.no_fsync = no_fsync;
 }
 
-server_context_page_manager::~server_context_page_manager() {
+server_context_ssd_manager::~server_context_ssd_manager() {
     // Each unique_ptr in conv_caches_ handles its own kv_ssd_free
 }
 
-void server_context_page_manager::set_model_info(const struct llama_model* model,
+void server_context_ssd_manager::set_model_info(const struct llama_model* model,
                                                    int cache_type_k, int cache_type_v) {
     if (!model) return;
 
@@ -108,7 +102,7 @@ void server_context_page_manager::set_model_info(const struct llama_model* model
             (unsigned long)h, cache_type_k, cache_type_v);
 }
 
-server_ssd_cache* server_context_page_manager::get_or_create_cache(uint64_t conv_hash) {
+server_ssd_cache* server_context_ssd_manager::get_or_create_cache(uint64_t conv_hash) {
     if (conv_hash == 0) return nullptr;
 
     auto it = conv_wrappers_.find(conv_hash);
@@ -180,18 +174,18 @@ server_ssd_cache* server_context_page_manager::get_or_create_cache(uint64_t conv
     return result;
 }
 
-uint64_t server_context_page_manager::get_timestamp_ms() const {
+uint64_t server_context_ssd_manager::get_timestamp_ms() const {
     auto now = std::chrono::system_clock::now();
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
 }
 
-void server_context_page_manager::evict_slot_internal(uint32_t slot_id) {
+void server_context_ssd_manager::evict_slot_internal(uint32_t slot_id) {
     auto it = checkpoints_.find(slot_id);
     if (it == checkpoints_.end()) return;
     checkpoints_.erase(it);
 }
 
-bool server_context_page_manager::store_checkpoint(
+bool server_context_ssd_manager::store_checkpoint(
     uint32_t slot_id,
     struct llama_context* ctx,
     const common_prompt_checkpoint& ckpt,
@@ -200,7 +194,7 @@ bool server_context_page_manager::store_checkpoint(
     return store_checkpoint_with_tokens(slot_id, ctx, nullptr, ckpt, nullptr, 0, turn_id);
 }
 
-bool server_context_page_manager::store_checkpoint_with_tokens(
+bool server_context_ssd_manager::store_checkpoint_with_tokens(
     uint32_t slot_id,
     struct llama_context* ctx,
     struct llama_context* ctx_dft,
@@ -256,7 +250,7 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     return true;
 }
 
-bool server_context_page_manager::load_checkpoint(
+bool server_context_ssd_manager::load_checkpoint(
     uint32_t slot_id,
     uint32_t /* turn_id */,
     struct llama_context* ctx,
@@ -299,7 +293,7 @@ bool server_context_page_manager::load_checkpoint(
     return ok;
 }
 
-bool server_context_page_manager::load_checkpoint_by_id(
+bool server_context_ssd_manager::load_checkpoint_by_id(
     uint64_t checkpoint_id,
     struct llama_context* ctx,
     struct llama_context* ctx_dft,
@@ -333,7 +327,7 @@ bool server_context_page_manager::load_checkpoint_by_id(
     return ok;
 }
 
-void server_context_page_manager::prefetch_for_slot(uint32_t slot_id, uint32_t /* turn_id */) {
+void server_context_ssd_manager::prefetch_for_slot(uint32_t slot_id, uint32_t /* turn_id */) {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = checkpoints_.find(slot_id);
     if (it == checkpoints_.end()) return;
@@ -349,7 +343,7 @@ void server_context_page_manager::prefetch_for_slot(uint32_t slot_id, uint32_t /
     }
 }
 
-void server_context_page_manager::on_turn_complete(uint32_t turn_id) {
+void server_context_ssd_manager::on_turn_complete(uint32_t turn_id) {
     // Notify all cache instances
     for (auto& [conv, wrapper] : conv_wrappers_) {
         wrapper->on_turn_complete(turn_id);
@@ -361,7 +355,7 @@ void server_context_page_manager::on_turn_complete(uint32_t turn_id) {
     }
 }
 
-bool server_context_page_manager::find_matching_checkpoint(
+bool server_context_ssd_manager::find_matching_checkpoint(
     const llama_token* tokens,
     size_t tokens_size,
     uint32_t current_turn,
@@ -462,7 +456,7 @@ bool server_context_page_manager::find_matching_checkpoint(
     return false;
 }
 
-bool server_context_page_manager::find_and_load_checkpoint(
+bool server_context_ssd_manager::find_and_load_checkpoint(
     const llama_token* tokens,
     size_t tokens_size,
     uint32_t current_turn,
@@ -574,12 +568,12 @@ bool server_context_page_manager::find_and_load_checkpoint(
     return ok;
 }
 
-void server_context_page_manager::evict_slot(uint32_t slot_id) {
+void server_context_ssd_manager::evict_slot(uint32_t slot_id) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     evict_slot_internal(slot_id);
 }
 
-bool server_context_page_manager::get_checkpoint_data(uint32_t slot_id, std::vector<uint8_t>& out_data) {
+bool server_context_ssd_manager::get_checkpoint_data(uint32_t slot_id, std::vector<uint8_t>& out_data) {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = checkpoints_.find(slot_id);
     if (it == checkpoints_.end()) return false;
@@ -594,7 +588,7 @@ bool server_context_page_manager::get_checkpoint_data(uint32_t slot_id, std::vec
     return false;
 }
 
-void server_context_page_manager::get_stats(
+void server_context_ssd_manager::get_stats(
     size_t* hot_bytes, size_t* warm_bytes, size_t* cold_bytes,
     size_t* total_checkpoints, size_t* max_checkpoints,
     uint64_t* hits, uint64_t* misses, float* hit_rate
@@ -621,11 +615,11 @@ void server_context_page_manager::get_stats(
     }
 }
 
-uint32_t server_context_page_manager::get_max_turn_id() const {
+uint32_t server_context_ssd_manager::get_max_turn_id() const {
     return kv_ssd_get_max_turn_id_global(ssd_base_path_.c_str());
 }
 
-server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const std::string& user_id) {
+server_ssd_cache* server_context_ssd_manager::get_or_create_user_cache(const std::string& user_id) {
     if (user_id.empty()) return nullptr;
 
     const uint64_t key = fnv1a_string(user_id);
@@ -706,7 +700,7 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
 
 namespace llama {
 
-size_t server_context_page_manager::compute_cold_total_bytes_locked() const {
+size_t server_context_ssd_manager::compute_cold_total_bytes_locked() const {
     auto sum_cache_bytes = [](const kv_ssd_cache* cache) -> size_t {
         if (!cache) return 0;
         size_t total = 0;
@@ -731,7 +725,7 @@ size_t server_context_page_manager::compute_cold_total_bytes_locked() const {
     return total;
 }
 
-void server_context_page_manager::evict_conversations_for_size_locked() {
+void server_context_ssd_manager::evict_conversations_for_size_locked() {
     if (cold_max_size_bytes == 0) return;
 
     size_t total = compute_cold_total_bytes_locked();

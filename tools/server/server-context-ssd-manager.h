@@ -2,11 +2,10 @@
 // Copyright (c) 2026 fewtarius
 // Server Context SSD Cache Integration
 
-#ifndef SERVER_CONTEXT_PAGE_MANAGER_H
-#define SERVER_CONTEXT_PAGE_MANAGER_H
+#ifndef SERVER_CONTEXT_SSD_MANAGER_H
+#define SERVER_CONTEXT_SSD_MANAGER_H
 
 #include "common/kv-ssd-cache.h"
-#include "common/kv_page_manager.h"
 #include "llama.h"
 #include "server-task.h"
 #include "server-common.h"
@@ -26,7 +25,7 @@ class server_ssd_cache;
  * Manages server-level checkpoint storage with SSD backing.
  * Uses kv_ssd_cache for hot/warm/cold tiering with disk persistence.
  */
-class server_context_page_manager {
+class server_context_ssd_manager {
 public:
     // Checkpoint stored in the manager
     struct stored_checkpoint {
@@ -42,13 +41,11 @@ public:
         std::vector<llama_token> tokens;  // Token sequence for matching
     };
 
-    server_context_page_manager(
-        const char* ssd_path,
-        const kv_eviction_config* cfg,
-        size_t n_tokens_total,
-        size_t max_cross_slot_checkpoints
-    );
-    ~server_context_page_manager();
+    server_context_ssd_manager(const char *          ssd_path,
+                                const kv_ssd_config * cfg,
+                                size_t                n_tokens_total,
+                                size_t                max_cross_slot_checkpoints);
+    ~server_context_ssd_manager();
 
     // Store a checkpoint (written to SSD and kept in hot tier)
     // ctx is required to compute full state (recurrent + KV cache) for SSD storage
@@ -230,4 +227,4 @@ private:
 
 } // namespace llama
 
-#endif // SERVER_CONTEXT_PAGE_MANAGER_H
+#endif // SERVER_CONTEXT_SSD_MANAGER_H

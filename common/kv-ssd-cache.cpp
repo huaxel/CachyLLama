@@ -61,64 +61,6 @@ uint64_t kv_ssd_hash_tokens(const uint32_t* tokens, size_t count) {
     return h;
 }
 
-
-// Write exactly `count` bytes to fd at offset.
-// Chunks at 64 MiB because Windows _write/_read return int (32-bit)
-// and cannot transfer >2 GiB in a single call. Also handles platforms
-// where ssize_t is 32-bit (MinGW) and large checkpoints (>=2 GiB).
-// Offsets are int64_t, not off_t: MSVC's off_t is 32-bit and wraps
-// negative once a checkpoint crosses 2 GiB.
-static bool pwrite_all(int fd, const void* buf, size_t count, int64_t offset) {
-    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
-    const char* ptr = (const char*)buf;
-    size_t remaining = count;
-    int64_t off = offset;
-    while (remaining > 0) {
-        size_t chunk = remaining;
-        if (chunk > chunk_max) {
-            chunk = chunk_max;
-        }
-        ssize_t n = pwrite(fd, ptr, chunk, off);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) {
-            errno = ENOSPC;
-            return false;
-        }
-        ptr += n;
-        off += n;
-        remaining -= (size_t)n;
-    }
-    return true;
-}
-
-// Read exactly `count` bytes from fd at offset.
-// Chunks at 64 MiB for the same reason as pwrite_all.
-static bool pread_all(int fd, void* buf, size_t count, int64_t offset) {
-    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
-    char* ptr = (char*)buf;
-    size_t remaining = count;
-    int64_t off = offset;
-    while (remaining > 0) {
-        size_t chunk = remaining;
-        if (chunk > chunk_max) {
-            chunk = chunk_max;
-        }
-        ssize_t n = pread(fd, ptr, chunk, off);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) { errno = EIO; return false; } // unexpected EOF
-        ptr += n;
-        off += n;
-        remaining -= (size_t)n;
-    }
-    return true;
-}
-
 // Get checkpoint file path: {model_dir}/ckpt-{id}.bin
 static std::string ckpt_path(const kv_ssd_cache* c, uint64_t id) {
     return c->model_dir + "/ckpt-" + std::to_string(id) + ".bin";
