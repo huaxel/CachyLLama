@@ -1,4 +1,7 @@
 #include "server-context.h"
+#include "server-context-ssd-manager.h"
+#include "kv-ssd-system-cache.h"
+#include "kv-ssd-cache.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -896,6 +899,20 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // SSD-backed KV cache
+    std::unique_ptr<llama::server_context_ssd_manager> ssd_page_manager;
+
+    // Global system prompt KV cache (cross-conversation)
+    std::unique_ptr<kv_ssd_system_cache> sys_cache;
+
+    // Per-slot system prompt hash tracking (dedupe extraction)
+    std::unordered_map<int, uint64_t> slot_sys_hash;
+
+    // Monotonic turn counter for SSD cache tiering (incremented per slot release)
+    uint32_t ssd_turn_counter = 0;
+
+    // Per-user concurrency tracking (user_id -> active slot count)
+    mutable std::unordered_map<std::string, int> user_counts_;
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1369,6 +1386,95 @@ private:
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
 
+        // SSD-backed KV cache initialization
+        if (!params_base.cache_ssd_path.empty()) {
+            kv_ssd_config cfg;
+            cfg.hot_ram_bytes  = params_base.cache_ssd_hot_ram_mib > 0
+                ? (size_t)params_base.cache_ssd_hot_ram_mib * 1024 * 1024 : 6ULL * 1024 * 1024 * 1024;
+            cfg.warm_ram_bytes = params_base.cache_ssd_warm_ram_mib > 0
+                ? (size_t)params_base.cache_ssd_warm_ram_mib * 1024 * 1024 : 2ULL * 1024 * 1024 * 1024;
+            // Explicit RAM caps are hard limits: disable auto-sizing so the per-conversation
+            // cache in common/kv-ssd-cache.cpp does not override these caps with values
+            // derived from sysinfo.freeram at conversation-create time. Both flags unset
+            // (default) keeps auto-sizing on so existing setups are unaffected.
+            cfg.auto_size = (params_base.cache_ssd_hot_ram_mib == 0 &&
+                             params_base.cache_ssd_warm_ram_mib == 0);
+            cfg.max_cold_checkpoints = params_base.cache_ssd_max_cold;
+            cfg.hot_turns = 2;
+            cfg.warm_turns = 4;
+
+            ssd_page_manager = std::make_unique<llama::server_context_ssd_manager>(
+                params_base.cache_ssd_path.c_str(), &cfg,
+                (size_t)n_ctx, params_base.cache_ssd_max_checkpoints);
+            ssd_page_manager->max_conversations = params_base.cache_ssd_max_conversations;
+            // Global cap on cold tier bytes across all conversation directories.
+            // 0 = unlimited (legacy default). Specified in MiB for parity with
+            // --cache-ssd-hot-ram / --cache-ssd-warm-ram.
+            ssd_page_manager->cold_max_size_bytes =
+                params_base.cache_ssd_cold_max_size_mib > 0
+                    ? (size_t)params_base.cache_ssd_cold_max_size_mib * 1024 * 1024
+                    : 0;
+            ssd_page_manager->set_no_fsync(params_base.cache_ssd_no_fsync);
+
+            // Set model info after page manager exists
+            ssd_page_manager->set_model_info(model_tgt,
+                params_base.cache_type_k, params_base.cache_type_v);
+
+            // Seed turn counter from max on disk (persistent across restarts)
+            ssd_turn_counter = ssd_page_manager->get_max_turn_id() + 1;
+
+            SRV_INF("SSD cache enabled: path=%s, hot=%d MiB, warm=%d MiB\n",
+                    params_base.cache_ssd_path.c_str(),
+                    params_base.cache_ssd_hot_ram_mib,
+                    params_base.cache_ssd_warm_ram_mib);
+        }
+
+        // Initialize global system prompt cache (cross-conversation reuse)
+        if (params_base.cache_ssd_system_prompts > 0 && !params_base.cache_ssd_path.empty()) {
+            // Compute model compat_hash (same FNV-1a as set_model_info)
+            char desc_buf[2048];
+            int desc_len = llama_model_desc(model_tgt, desc_buf, sizeof(desc_buf));
+            uint64_t compat_h = (desc_len > 0) ? 14695981039346656037ULL : 0;
+            if (desc_len > 0) {
+                for (int i = 0; i < desc_len; i++) {
+                    compat_h ^= (uint64_t)(unsigned char)desc_buf[i];
+                    compat_h *= 1099511628211ULL;
+                }
+                uint32_t tk = (uint32_t)params_base.cache_type_k;
+                compat_h ^= (uint64_t)(tk & 0xFF);         compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tk >> 8) & 0xFF);  compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tk >> 16) & 0xFF); compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tk >> 24) & 0xFF); compat_h *= 1099511628211ULL;
+                uint32_t tv = (uint32_t)params_base.cache_type_v;
+                compat_h ^= (uint64_t)(tv & 0xFF);         compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tv >> 8) & 0xFF);  compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tv >> 16) & 0xFF); compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tv >> 24) & 0xFF); compat_h *= 1099511628211ULL;
+            }
+
+            static auto hex64 = [](uint64_t h) {
+                char buf[17];
+                std::snprintf(buf, sizeof(buf), "%016lx", (unsigned long)h);
+                return std::string(buf);
+            };
+
+            std::string sys_dir = params_base.cache_ssd_path
+                + "/sys-" + hex64(compat_h);
+
+            sys_cache = std::make_unique<kv_ssd_system_cache>();
+            sys_cache->max_entries = (size_t)params_base.cache_ssd_system_prompts;
+            sys_cache->max_unused_days = params_base.cache_ssd_system_max_days;
+
+            if (sys_cache->init(sys_dir, compat_h)) {
+                SRV_INF("system prompt cache enabled: max_entries=%d, max_days=%d, path=%s\n",
+                        params_base.cache_ssd_system_prompts,
+                        params_base.cache_ssd_system_max_days,
+                        sys_dir.c_str());
+            } else {
+                SRV_WRN("%s\n", "system prompt cache init failed, disabling");
+                sys_cache.reset();
+            }
+        }
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
             model_name = *params_base.model_alias.begin();
