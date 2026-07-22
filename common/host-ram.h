@@ -11,6 +11,10 @@
 //   host_available_ram()        - same but with an 8 GiB conservative
 //                                 fallback so legacy auto-sizing callers
 //                                 don't have to think about it.
+//
+// Both share a thread-safe 5-second TTL cache so repeated calls in hot
+// paths (Vulkan FA scratch gate per prefill layer; SSD auto-sizing at
+// conversation-create time) don't hammer /proc/meminfo or Mach host ports.
 
 #pragma once
 
@@ -26,7 +30,7 @@ bool host_available_ram_query(std::size_t * out_bytes);
 
 // Currently available RAM in bytes. On Linux/macOS this is the reclaimable
 // memory (free + cache / inactive). On unsupported platforms an 8 GiB fallback.
-// Safe to call frequently - the underlying syscalls are cheap and read-only.
+// Calls share a 5-second TTL cache; frequent callers see cached results.
 std::size_t host_available_ram();
 
 }  // namespace common

@@ -17,8 +17,8 @@ add_library(${TARGET} STATIC
     server-context.h
     server-stream.cpp
     server-stream.h
-    server-context-page-manager.cpp
-    server-context-page-manager.h
+    server-context-ssd-manager.cpp
+    server-context-ssd-manager.h
     server-context-ssd-cache.cpp
     server-context-ssd-cache.h
     server-tools.cpp
