@@ -13,7 +13,7 @@
 // Silicon) this made the cache eat RAM shared with the iGPU.
 //
 // Fix: in tools/server/server-context.cpp, when either RAM-cap flag is set,
-// disable auto-sizing before constructing server_context_page_manager.
+// disable auto-sizing before constructing server_context_ssd_manager.
 //
 // These tests verify that:
 //   1. When auto_size=false, kv_ssd_init preserves the explicit caps.

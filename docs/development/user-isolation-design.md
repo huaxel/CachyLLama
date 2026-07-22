@@ -277,7 +277,7 @@ The SSD cache parameters (`--cache-ssd-path`,
 | `common/kv-ssd-cache.cpp` | Pass `namespace_prefix` through to `kv_ssd_open` |
 | `tools/server/server-task.{h,cpp}` | `server_task::user_id` field and `validate_user_id` |
 | `tools/server/server-chat.cpp` | Extract `metadata.user_id` (Anthropic) into the task |
-| `tools/server/server-context-page-manager.{h,cpp}` | Route `user_id` to a `u/` namespace; disable cross-user continuation matching |
+| `tools/server/server-context-ssd-manager.{h,cpp}` | Route `user_id` to a `u/` namespace; disable cross-user continuation matching |
 | `tools/server/server-context.cpp` | Per-user cap check; per-slot `user_id`; cap-aware LCP/LRU loops; HTTP 429 fast-fail in `handle_completions_impl` |
 | `tools/server/server-context.h` | (no API change required; const method on impl) |
 | `tools/server/server-queue.h` | `mutex_tasks` is `mutable` and public for the const cap check |
@@ -301,6 +301,6 @@ The SSD cache parameters (`--cache-ssd-path`,
 
 - DeepSeek docs: <https://api-docs.deepseek.com/quick_start/rate_limit>
 - Current `conv_hash` definition: `common/kv-ssd-cache.cpp:41`
-- Page manager: `tools/server/server-context-page-manager.{h,cpp}`
+- Page manager: `tools/server/server-context-ssd-manager.{h,cpp}`
 - `metadata.user_id` extraction: `tools/server/server-chat.cpp`
 - Slot allocation: `tools/server/server-context.cpp` (around line 1332)
