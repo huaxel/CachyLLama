@@ -145,4 +145,64 @@ static inline unsigned long portable_get_last_win32_error(void) { return 0; }
 #define SSD_WIN32_ERR_ARG
 #endif
 
+// =============================================================================
+// Chunked I/O helpers
+//
+// Write/read exactly `count` bytes to/from fd at offset.
+// Chunks at 64 MiB because Windows _write/_read return int (32-bit)
+// and cannot transfer >2 GiB in a single call. Also handles platforms
+// where ssize_t is 32-bit (MinGW) and large checkpoints (>=2 GiB).
+// Offsets are int64_t, not off_t: MSVC's off_t is 32-bit and wraps
+// negative once a checkpoint crosses 2 GiB.
+// =============================================================================
+
+static inline bool pwrite_all(int fd, const void* buf, size_t count, int64_t offset) {
+    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
+    const char* ptr = (const char*)buf;
+    size_t remaining = count;
+    int64_t off = offset;
+    while (remaining > 0) {
+        size_t chunk = remaining;
+        if (chunk > chunk_max) {
+            chunk = chunk_max;
+        }
+        ssize_t n = pwrite(fd, ptr, chunk, off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) {
+            errno = ENOSPC;
+            return false;
+        }
+        ptr += n;
+        off += n;
+        remaining -= (size_t)n;
+    }
+    return true;
+}
+
+static inline bool pread_all(int fd, void* buf, size_t count, int64_t offset) {
+    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
+    char* ptr = (char*)buf;
+    size_t remaining = count;
+    int64_t off = offset;
+    while (remaining > 0) {
+        size_t chunk = remaining;
+        if (chunk > chunk_max) {
+            chunk = chunk_max;
+        }
+        ssize_t n = pread(fd, ptr, chunk, off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) { errno = EIO; return false; } // unexpected EOF
+        ptr += n;
+        off += n;
+        remaining -= (size_t)n;
+    }
+    return true;
+}
+
 #endif

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 fewtarius
 
 #include "llama-moe-residency.h"
