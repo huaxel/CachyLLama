@@ -23,57 +23,6 @@
 
 namespace {
 
-// I/O helpers (duplicated minimally from kv-ssd-cache.cpp to keep
-// the system cache as a self-contained translation unit).
-bool pwrite_all(int fd, const void* buf, size_t count, int64_t offset) {
-    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
-    const char* ptr = (const char*)buf;
-    size_t remaining = count;
-    int64_t off = offset;
-    while (remaining > 0) {
-        size_t chunk = remaining;
-        if (chunk > chunk_max) {
-            chunk = chunk_max;
-        }
-        ssize_t n = pwrite(fd, ptr, chunk, off);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) {
-            errno = ENOSPC;
-            return false;
-        }
-        ptr += n;
-        off += n;
-        remaining -= (size_t)n;
-    }
-    return true;
-}
-
-bool pread_all(int fd, void* buf, size_t count, int64_t offset) {
-    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
-    char* ptr = (char*)buf;
-    size_t remaining = count;
-    int64_t off = offset;
-    while (remaining > 0) {
-        size_t chunk = remaining;
-        if (chunk > chunk_max) {
-            chunk = chunk_max;
-        }
-        ssize_t n = pread(fd, ptr, chunk, off);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) { errno = EIO; return false; }
-        ptr += n;
-        off += n;
-        remaining -= (size_t)n;
-    }
-    return true;
-}
-
 uint64_t now_unix() {
     return (uint64_t)std::time(nullptr);
 }
