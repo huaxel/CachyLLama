@@ -933,7 +933,7 @@ private:
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     // SSD-backed KV cache
-    std::unique_ptr<llama::server_context_ssd_manager> ssd_page_manager;
+    std::unique_ptr<llama::server_context_ssd_manager> ssd_cache_manager;
 
     // Global system prompt KV cache (cross-conversation)
     std::unique_ptr<kv_ssd_system_cache> sys_cache;
@@ -1492,25 +1492,25 @@ private:
             cfg.hot_turns = 2;
             cfg.warm_turns = 4;
 
-            ssd_page_manager = std::make_unique<llama::server_context_ssd_manager>(
+            ssd_cache_manager = std::make_unique<llama::server_context_ssd_manager>(
                 params_base.cache_ssd_path.c_str(), &cfg,
                 (size_t)n_ctx, params_base.cache_ssd_max_checkpoints);
-            ssd_page_manager->max_conversations = params_base.cache_ssd_max_conversations;
+            ssd_cache_manager->max_conversations = params_base.cache_ssd_max_conversations;
             // Global cap on cold tier bytes across all conversation directories.
             // 0 = unlimited (legacy default). Specified in MiB for parity with
             // --cache-ssd-hot-ram / --cache-ssd-warm-ram.
-            ssd_page_manager->cold_max_size_bytes =
+            ssd_cache_manager->cold_max_size_bytes =
                 params_base.cache_ssd_cold_max_size_mib > 0
                     ? (size_t)params_base.cache_ssd_cold_max_size_mib * 1024 * 1024
                     : 0;
-            ssd_page_manager->set_no_fsync(params_base.cache_ssd_no_fsync);
+            ssd_cache_manager->set_no_fsync(params_base.cache_ssd_no_fsync);
 
             // Set model info after page manager exists
-            ssd_page_manager->set_model_info(model_tgt,
+            ssd_cache_manager->set_model_info(model_tgt,
                 params_base.cache_type_k, params_base.cache_type_v);
 
             // Seed turn counter from max on disk (persistent across restarts)
-            ssd_turn_counter = ssd_page_manager->get_max_turn_id() + 1;
+            ssd_turn_counter = ssd_cache_manager->get_max_turn_id() + 1;
 
             SRV_INF("SSD cache enabled: path=%s, hot=%d MiB, warm=%d MiB\n",
                     params_base.cache_ssd_path.c_str(),
@@ -2714,10 +2714,10 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
         // SSD-backed KV cache: store checkpoint on disk
-        if (ssd_page_manager) {
+        if (ssd_cache_manager) {
             const auto & prefix_tokens = slot.prompt.tokens;
             const llama_tokens prefix_text = prefix_tokens.get_text_tokens();
-            ssd_page_manager->store_checkpoint_with_tokens(
+            ssd_cache_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur,
                 prefix_text.data(),
                 prefix_text.size(),
@@ -2768,11 +2768,11 @@ private:
                 cur.pos_min, cur.pos_max, cur.n_tokens,
                 (float)cur.size() / 1024 / 1024);
 
-        if (ssd_page_manager) {
+        if (ssd_cache_manager) {
             const llama_tokens prefix_tokens = slot.task
                 ? slot.task->tokens.get_text_tokens()
                 : slot.prompt.tokens.get_text_tokens();
-            ssd_page_manager->store_checkpoint_with_tokens(
+            ssd_cache_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
                 prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
                 slot.task ? slot.task->user_id : std::string());
@@ -2784,7 +2784,7 @@ private:
     // Check if this slot's current prompt represents a system prompt
     // that should be stored in the global cache.
     void maybe_extract_system_prompt(server_slot & slot) {
-        if (!sys_cache || !ssd_page_manager) {
+        if (!sys_cache || !ssd_cache_manager) {
             return;
         }
 
@@ -2851,8 +2851,8 @@ private:
         ssd_turn_counter++;
 
         // Store the final state to SSD
-        if (ssd_page_manager && slot.prompt.n_tokens() > 0) {
-            ssd_page_manager->on_turn_complete(ssd_turn_counter);
+        if (ssd_cache_manager && slot.prompt.n_tokens() > 0) {
+            ssd_cache_manager->on_turn_complete(ssd_turn_counter);
         }
 
         // Clean up per-slot state
@@ -3644,14 +3644,14 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
-                        SLT_DBG(slot, "[PROBE] prefill-init n_past=0 slot.prompt=%zu ssd_page_manager=%d cache_prompt=%d\n",
-                                slot.prompt.tokens.size(), (int)(ssd_page_manager != nullptr), (int)slot.task->params.cache_prompt);
+                        SLT_DBG(slot, "[PROBE] prefill-init n_past=0 slot.prompt=%zu ssd_cache_manager=%d cache_prompt=%d\n",
+                                slot.prompt.tokens.size(), (int)(ssd_cache_manager != nullptr), (int)slot.task->params.cache_prompt);
 
                         // cold start: try per-conversation SSD checkpoint restore
                         // Must populate slot.prompt.tokens so get_common_prefix() finds the match
                         // Skip for multimodal: text-token match could restore a checkpoint
                         // whose KV holds different image embeddings.
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager && !slot.task->tokens.has_mtmd) {
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_cache_manager && !slot.task->tokens.has_mtmd) {
                             const auto task_tokens = slot.task->tokens.get_text_tokens();
                             if (!task_tokens.empty()) {
                                 int32_t ssd_pos_min = 0, ssd_pos_max = 0;
@@ -3660,7 +3660,7 @@ private:
                                 float ssd_overlap = 0.0f;
                                 bool ssd_is_continuation = false;
                                 std::vector<uint8_t> ssd_spec_data;
-                                if (ssd_page_manager->find_and_load_checkpoint(
+                                if (ssd_cache_manager->find_and_load_checkpoint(
                                         task_tokens.data(), task_tokens.size(),
                                         ssd_turn_counter, ctx_tgt, ctx_dft.get(),
                                         (uint32_t)slot.id,
@@ -3762,7 +3762,7 @@ private:
                         // Only cold starts (empty slot) need system prompt cache.
                         // Warm slots (n_tokens > 0) already have full context from
                         // the in-memory prompt cache LCP restore or previous turn.
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager && !slot.task->tokens.has_mtmd) {
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_cache_manager && !slot.task->tokens.has_mtmd) {
                             const auto task_tokens = slot.task->tokens.get_text_tokens();
                             int n_sys = kv_detect_system_prompt_boundary(
                                 llama_model_get_vocab(llama_get_model(ctx_tgt)),
@@ -4074,7 +4074,7 @@ private:
                             // inserts a few dynamic tokens between the system section and
                             // the first user message, shifting the boundary by tens of
                             // tokens between turns.
-                            if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_page_manager) {
+                            if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_cache_manager) {
                                 const auto & task_tokens = slot.task->tokens.get_tokens();
                                 int n_sys = kv_detect_system_prompt_boundary(
                                     llama_model_get_vocab(llama_get_model(ctx_tgt)),
