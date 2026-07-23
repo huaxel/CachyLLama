@@ -279,6 +279,7 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 # Regression test for fewtarius/llama-ai issue #6:
 # SSD cache auto-sizing must respect --cache-ssd-hot-ram / --cache-ssd-warm-ram.
 llama_build_and_test(test-ssd-cache-caps.cpp)
+llama_build_and_test(test-ssd-cache-prefix-match.cpp)
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 # the test serves its repos from an httplib server, and the library links it privately
