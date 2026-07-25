@@ -131,8 +131,9 @@ bool kv_ssd_system_cache::store(const uint32_t* tokens, uint32_t n_tokens,
         LOG_WRN("system cache: store called before init\n");
         return false;
     }
-    if (!tokens || n_tokens == 0 || !data || data_size == 0) {
-        LOG_WRN("system cache: store called with invalid args\n");
+    if (!tokens || n_tokens == 0 || n_tokens > KV_SSD_SYS_TOKEN_MAX ||
+        !data || data_size == 0) {
+        LOG_WRN("system cache: store called with invalid or unverifiable args\n");
         return false;
     }
 
@@ -205,128 +206,39 @@ bool kv_ssd_system_cache::store(const uint32_t* tokens, uint32_t n_tokens,
 }
 
 // =============================================================================
-// Find
+// Exact load
 // =============================================================================
 
-const kv_ssd_system_entry* kv_ssd_system_cache::find(const uint32_t* tokens, uint32_t n_tokens) {
-    if (!initialized || !tokens || n_tokens == 0) return nullptr;
+bool kv_ssd_system_cache::load(const uint32_t* tokens, uint32_t n_tokens,
+                                std::vector<uint8_t>& out_data) {
+    if (!initialized || !tokens || n_tokens == 0 || n_tokens > KV_SSD_SYS_TOKEN_MAX) {
+        return false;
+    }
 
-    uint64_t hash = hash_tokens(tokens, n_tokens);
-
+    const uint64_t hash = hash_tokens(tokens, n_tokens);
     std::lock_guard<std::mutex> lock(mutex_);
 
     auto it = entries_.find(hash);
-    if (it == entries_.end()) {
+    if (it == entries_.end() || it->second.n_tokens != n_tokens ||
+        it->second.tokens.size() != n_tokens) {
         stats_misses++;
-        return nullptr;
+        return false;
     }
 
-    // Verify n_tokens matches and the first n_tokens are identical
-    // (defense in depth against hash collisions or file corruption).
-    if (it->second.n_tokens != n_tokens) {
-        LOG_WRN("system cache: hash collision? hash=%s stored_tokens=%u requested=%u\n",
-                hex16(hash).c_str(), it->second.n_tokens, n_tokens);
-        stats_misses++;
-        return nullptr;
-    }
-    if (n_tokens > KV_SSD_SYS_TOKEN_MAX) {
-        // We can't fully verify beyond the stored prefix. Trust the hash.
-    } else {
-        for (uint32_t i = 0; i < n_tokens; i++) {
-            if (it->second.tokens[i] != tokens[i]) {
-                LOG_WRN("system cache: token mismatch at index %u hash=%s\n",
-                        i, hex16(hash).c_str());
-                stats_misses++;
-                return nullptr;
-            }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (it->second.tokens[i] != tokens[i]) {
+            stats_misses++;
+            return false;
         }
     }
 
+    out_data = it->second.data;
     it->second.last_used = now_unix();
     it->second.access_count++;
     stats_hits++;
 
     LOG_DBG("system cache: hit hash=%s tokens=%u access_count=%u\n",
             hex16(hash).c_str(), n_tokens, it->second.access_count);
-
-    return &it->second;
-}
-
-bool kv_ssd_system_cache::load(const uint32_t* tokens, uint32_t n_tokens,
-                                std::vector<uint8_t>& out_data) {
-    const kv_ssd_system_entry* entry = find(tokens, n_tokens);
-    if (!entry) return false;
-    out_data = entry->data;
-    return true;
-}
-
-const kv_ssd_system_entry* kv_ssd_system_cache::find_prefix_match(
-    const uint32_t* tokens, uint32_t n_query_tokens, uint32_t min_match)
-{
-    // Fallback for when boundary detection returns a slightly different n_sys
-    // than what was stored (e.g. the chat template inserts a few tokens
-    // between the system section and the first user message that vary
-    // between turns). The exact find() fails on n_tokens mismatch or hash
-    // mismatch, but the underlying system prompt is the same - we just need
-    // to find any stored entry whose first min(KV_SSD_SYS_TOKEN_MAX,
-    // n_query_tokens, entry.n_tokens) tokens match the query.
-    //
-    // Returns the entry whose prefix matches the query prefix for at
-    // least `min_match` tokens, or nullptr if none found.
-    if (!initialized || !tokens || n_query_tokens == 0 || min_match == 0) return nullptr;
-
-    const uint32_t verify_len = std::min({
-        (uint32_t)KV_SSD_SYS_TOKEN_MAX,
-        n_query_tokens,
-        (uint32_t)4096  // never scan more than 4k tokens per entry
-    });
-    if (verify_len < min_match) return nullptr;
-
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // Use a non-const pointer for the bookkeeping writes (last_used/access_count)
-    // - the entries_ map values are mutable through the lock.
-    kv_ssd_system_entry* best = nullptr;
-    uint32_t best_match = 0;
-
-    for (auto & [hash, entry] : entries_) {
-        const uint32_t entry_prefix_len = std::min({
-            (uint32_t)entry.tokens.size(),
-            n_query_tokens,
-            verify_len
-        });
-        if (entry_prefix_len < min_match) continue;
-
-        uint32_t matched = 0;
-        for (uint32_t i = 0; i < entry_prefix_len; i++) {
-            if (entry.tokens[i] != tokens[i]) break;
-            matched++;
-        }
-
-        if (matched >= min_match && matched > best_match) {
-            best_match = matched;
-            best = &entry;
-        }
-    }
-
-    if (best) {
-        best->last_used = now_unix();
-        best->access_count++;
-        stats_hits++;
-        LOG_INF("system cache: prefix-match hit stored=%u query=%u matched=%u\n",
-                best->n_tokens, n_query_tokens, best_match);
-    } else {
-        stats_misses++;
-    }
-
-    return best;
-}
-
-bool kv_ssd_system_cache::load_prefix(const uint32_t* tokens, uint32_t n_query_tokens,
-                                      uint32_t min_match, std::vector<uint8_t>& out_data) {
-    const kv_ssd_system_entry* entry = find_prefix_match(tokens, n_query_tokens, min_match);
-    if (!entry) return false;
-    out_data = entry->data;
     return true;
 }
 
