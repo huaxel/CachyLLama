@@ -3190,7 +3190,8 @@ private:
     // Check if this slot's current prompt represents a system prompt
     // that should be stored in the global cache.
     void maybe_extract_system_prompt(server_slot & slot) {
-        if (!sys_cache || !ssd_cache_manager) {
+        if (!sys_cache || !ssd_cache_manager || !slot.task ||
+            slot.task->tokens.has_mtmd || slot.prompt.tokens.has_mtmd) {
             return;
         }
 
@@ -3240,7 +3241,14 @@ private:
             return;
         }
 
-        // Get the state at the system prompt boundary
+        // The state must have been captured immediately after the system
+        // prompt. This hook normally runs after the full prompt, so refuse
+        // to store unless the sequence position proves the boundary.
+        if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != n_sys - 1) {
+            slot_sys_hash[slot.id] = 1;
+            return;
+        }
+
         size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         if (state_size == 0) {
             slot_sys_hash[slot.id] = 1;
@@ -4654,7 +4662,6 @@ private:
                                     params_base.chat_template.empty() ? nullptr : params_base.chat_template.c_str());
 
                                 const int32_t MIN_USEFUL_SYS_TOKENS = 16;
-                                const uint32_t MIN_PREFIX_MATCH = 64;
 
                                 int recovered_n_sys = 0;
                                 std::vector<uint8_t> sys_data;
