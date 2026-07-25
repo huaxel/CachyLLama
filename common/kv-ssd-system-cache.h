@@ -26,7 +26,7 @@
 
 // Magic numbers for the system prompt cache file format
 #define KV_SSD_SYS_MAGIC_REC  0x4B565359  // "KVSM" - system record
-#define KV_SSD_SYS_VERSION    1
+#define KV_SSD_SYS_VERSION    2
 
 // Maximum number of system prompt tokens stored per entry for verification
 // and display. The actual KV state covers all tokens up to n_tokens.
@@ -96,31 +96,11 @@ public:
     bool store(const uint32_t* tokens, uint32_t n_tokens,
                const uint8_t* data, size_t data_size);
 
-    // Find a matching system prompt entry by content hash.
-    // Returns a pointer to the entry (valid until next store/evict) or nullptr.
-    // Bumps last_used and access_count on hit.
-    const kv_ssd_system_entry* find(const uint32_t* tokens, uint32_t n_tokens);
-
-    // Prefix-match fallback for when exact find() fails (e.g. boundary
-    // detection returns a slightly different n_sys than what was stored,
-    // because the chat template inserts a few dynamic tokens at the
-    // system/user boundary that differ between turns).
-    //
-    // Scans all stored entries and returns the one whose stored prefix
-    // matches the query prefix for at least `min_match` tokens. Verifies
-    // up to KV_SSD_SYS_TOKEN_MAX tokens per entry.
-    const kv_ssd_system_entry* find_prefix_match(
-        const uint32_t* tokens, uint32_t n_query_tokens, uint32_t min_match);
-
-    // Load a system prompt's KV state into out_data.
-    // Returns true on success. Caller is responsible for restoring the data
-    // to the llama_context.
+    // Load a system prompt's KV state into out_data after exact token
+    // validation. The copy is made while holding the cache lock so callers
+    // never observe an entry being evicted or replaced.
     bool load(const uint32_t* tokens, uint32_t n_tokens,
               std::vector<uint8_t>& out_data);
-
-    // Load via prefix-match fallback. Returns true on hit.
-    bool load_prefix(const uint32_t* tokens, uint32_t n_query_tokens,
-                     uint32_t min_match, std::vector<uint8_t>& out_data);
 
     // Force-evict entries that have not been used in N days.
     // Returns the number of entries evicted.

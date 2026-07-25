@@ -31,7 +31,7 @@
 // Magic numbers
 static const uint32_t KV_SSD_MAGIC_INDEX = 0x4B564944; // "KVID"
 static const uint32_t KV_SSD_MAGIC_REC   = 0x4B565243; // "KVRC"
-static const uint32_t KV_SSD_VERSION     = 3;           // v3 = per-file format + dft/spec blobs
+static const uint32_t KV_SSD_VERSION     = 4;           // v4 = text-only persisted checkpoint keys
 
 // =============================================================================
 // Internal helpers
