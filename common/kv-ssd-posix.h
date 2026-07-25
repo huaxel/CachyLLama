@@ -19,6 +19,12 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+
+// The CRT exposes a shared file position for _get_osfhandle() handles.
+// Serialize seek-plus-I/O so concurrent cache operations cannot interleave
+// between SetFilePointerEx and ReadFile/WriteFile.
+inline std::mutex g_portable_positional_io_mutex;
 
 // Last Windows error code for diagnostic logging.
 // thread_local: each thread tracks its own error to avoid races when
@@ -69,6 +75,7 @@ static inline int portable_fsync(int fd) {
 // Note: offset is int64_t, not off_t — MSVC's off_t is 32-bit (long) and
 // wraps negative past 2 GiB, which SetFilePointerEx rejects (ERROR_NEGATIVE_SEEK).
 static inline ssize_t portable_pwrite(int fd, const void * buf, size_t count, int64_t offset) {
+    std::lock_guard<std::mutex> lock(g_portable_positional_io_mutex);
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
     LARGE_INTEGER li;
@@ -97,6 +104,7 @@ static inline ssize_t portable_pwrite(int fd, const void * buf, size_t count, in
 #define pwrite portable_pwrite
 
 static inline ssize_t portable_pread(int fd, void * buf, size_t count, int64_t offset) {
+    std::lock_guard<std::mutex> lock(g_portable_positional_io_mutex);
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
     LARGE_INTEGER li;
