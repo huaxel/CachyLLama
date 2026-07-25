@@ -2054,15 +2054,17 @@ private:
         slot.task = std::make_unique<const server_task>(std::move(task));
         slot.user_id_ = slot.task->user_id; // remember owner for affinity + counter release
 
-        // Compute conversation hash once from the full task tokens.
-        // All checkpoints (mid-prompt and deferred) must use the same
-        // hash to prevent splitting checkpoints across conversations.
+        // Compute a stable conversation namespace from the initial text
+        // prefix. All checkpoints in a conversation reuse this namespace;
+        // full token validation still happens before restoring state.
         {
             // get_text_tokens (not get_tokens) so multimodal tasks don't abort on
             // the GGML_ASSERT(!has_mtmd) in get_tokens(); text tokens are a stable
             // hash basis and identical to get_tokens() for non-multimodal tasks.
             const auto task_tokens = slot.task->tokens.get_text_tokens();
-            size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
+            // Keep the namespace stable across turns while bounding the
+            // hashing cost. Full token validation still happens before restore.
+            const size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
             slot.conv_hash = kv_ssd_hash_tokens(
                 (const uint32_t *)task_tokens.data(), hash_len);
         }
@@ -2718,8 +2720,10 @@ private:
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-        // SSD-backed KV cache: store checkpoint on disk
-        if (ssd_cache_manager) {
+        // Text-token keys cannot validate media embeddings. Keep multimodal
+        // state in memory only; never persist it in the text-keyed SSD cache.
+        if (ssd_cache_manager && !slot.prompt.tokens.has_mtmd &&
+            (!slot.task || !slot.task->tokens.has_mtmd)) {
             const auto & prefix_tokens = slot.prompt.tokens;
             const llama_tokens prefix_text = prefix_tokens.get_text_tokens();
             ssd_cache_manager->store_checkpoint_with_tokens(
@@ -2773,10 +2777,9 @@ private:
                 cur.pos_min, cur.pos_max, cur.n_tokens,
                 (float)cur.size() / 1024 / 1024);
 
-        if (ssd_cache_manager) {
-            const llama_tokens prefix_tokens = slot.task
-                ? slot.task->tokens.get_text_tokens()
-                : slot.prompt.tokens.get_text_tokens();
+        if (ssd_cache_manager && slot.task && !slot.task->tokens.has_mtmd &&
+            !slot.prompt.tokens.has_mtmd) {
+            const llama_tokens prefix_tokens = slot.task->tokens.get_text_tokens();
             ssd_cache_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
                 prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
@@ -2789,7 +2792,8 @@ private:
     // Check if this slot's current prompt represents a system prompt
     // that should be stored in the global cache.
     void maybe_extract_system_prompt(server_slot & slot) {
-        if (!sys_cache || !ssd_cache_manager) {
+        if (!sys_cache || !ssd_cache_manager || !slot.task ||
+            slot.task->tokens.has_mtmd || slot.prompt.tokens.has_mtmd) {
             return;
         }
 
@@ -2826,7 +2830,14 @@ private:
             return;
         }
 
-        // Get the state at the system prompt boundary
+        // The state must have been captured immediately after the system
+        // prompt. This hook normally runs after the full prompt, so refuse
+        // to store unless the sequence position proves the boundary.
+        if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != n_sys - 1) {
+            slot_sys_hash[slot.id] = 1;
+            return;
+        }
+
         size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         if (state_size == 0) {
             slot_sys_hash[slot.id] = 1;
@@ -4089,8 +4100,10 @@ private:
                             // inserts a few dynamic tokens between the system section and
                             // the first user message, shifting the boundary by tens of
                             // tokens between turns.
-                            if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_cache_manager) {
-                                const auto & task_tokens = slot.task->tokens.get_tokens();
+                            // Skip for multimodal: text-token keys cannot validate
+                            // media embeddings, and get_tokens() asserts !has_mtmd.
+                            if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_cache_manager && !slot.task->tokens.has_mtmd) {
+                                const auto   task_tokens = slot.task->tokens.get_text_tokens();
                                 int n_sys = kv_detect_system_prompt_boundary(
                                     llama_model_get_vocab(llama_get_model(ctx_tgt)),
                                     task_tokens.data(),
@@ -4098,33 +4111,19 @@ private:
                                     params_base.chat_template.empty() ? nullptr : params_base.chat_template.c_str());
 
                                 const int32_t MIN_USEFUL_SYS_TOKENS = 16;
-                                const uint32_t MIN_PREFIX_MATCH = 64;
 
                                 int recovered_n_sys = 0;
                                 std::vector<uint8_t> sys_data;
                                 bool recovered = false;
 
-                                if (n_sys >= MIN_USEFUL_SYS_TOKENS && n_sys < (int32_t)task_tokens.size()) {
-                                    if (sys_cache->load((const uint32_t*)task_tokens.data(),
-                                                        (uint32_t)n_sys, sys_data)) {
-                                        recovered_n_sys = n_sys;
-                                        recovered = true;
-                                    } else if ((uint32_t)n_sys >= MIN_PREFIX_MATCH &&
-                                               sys_cache->load_prefix((const uint32_t*)task_tokens.data(),
-                                                       (uint32_t)n_sys, MIN_PREFIX_MATCH, sys_data)) {
-                                        // Prefix fallback matched. Use the boundary as
-                                        // n_past - the loaded state's recurrent state covers
-                                        // up to the stored entry's n_tokens, but for hybrid
-                                        // models the state at position N is computed from
-                                        // tokens [0, N). If the first 64+ tokens match we
-                                        // accept the approximate match; any model state drift
-                                        // is bounded by the small divergent region at the
-                                        // boundary.
-                                        recovered_n_sys = n_sys;
-                                        recovered = true;
-                                        SLT_DBG(slot, "[PROBE] sys-cache-fallback prefix-match recovered at n_sys=%d (exact match failed)\n",
-                                                n_sys);
-                                    }
+                                // Recurrent state is valid only for an exact,
+                                // fully-verifiable system-token sequence. Never
+                                // restore from an approximate prefix match.
+                                if (n_sys >= MIN_USEFUL_SYS_TOKENS && n_sys < (int32_t)task_tokens.size() &&
+                                    sys_cache->load((const uint32_t*)task_tokens.data(),
+                                                    (uint32_t)n_sys, sys_data)) {
+                                    recovered_n_sys = n_sys;
+                                    recovered = true;
                                 }
 
                                 if (recovered) {

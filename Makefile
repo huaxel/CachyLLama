@@ -44,8 +44,7 @@ DEPLOY_DIR  ?= /opt/cachy-llama/bin
 ENABLE_DEPLOY ?= 0
 
 # --- Derived flags ---
-CMAKE_FLAGS = \
-	-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
+CMAKE_BACKEND_FLAGS = \
 	-DGGML_CUDA=$(GGML_CUDA) \
 	-DGGML_VULKAN=$(GGML_VULKAN) \
 	-DGGML_METAL=$(GGML_METAL) \
@@ -53,6 +52,7 @@ CMAKE_FLAGS = \
 	-DGGML_SYCL=$(GGML_SYCL) \
 	-DGGML_OPENCL=$(GGML_OPENCL) \
 	-DGGML_CANN=$(GGML_CANN)
+CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_BACKEND_FLAGS)
 
 # Detect Vulkan availability (glslc)
 HAVE_GLSLC := $(shell which glslc 2>/dev/null && echo yes || echo no)
@@ -82,20 +82,20 @@ sync-merge:
 	git fetch $(UPSTREAM)
 	@printf "$(BLUE)⟳ Merging $(UPSTREAM)/$(BRANCH) into $(BRANCH)...$(NC)\n"
 	git checkout $(BRANCH) && git merge $(UPSTREAM)/$(BRANCH)
+	@$(MAKE) release
 	@printf "$(BLUE)⟳ Pushing to $(ORIGIN)...$(NC)\n"
 	git push $(ORIGIN) $(BRANCH)
 	@printf "$(GREEN)✓ $(BRANCH) synced with upstream$(NC)\n"
-	@$(MAKE) release
 
 sync:
 	@printf "$(BLUE)⟳ Fetching $(UPSTREAM)...$(NC)\n"
 	git fetch $(UPSTREAM)
 	@printf "$(BLUE)⟳ Rebasing $(BRANCH) onto $(UPSTREAM)/$(BRANCH)...$(NC)\n"
 	git checkout $(BRANCH) && git pull --rebase $(UPSTREAM) $(BRANCH)
+	@$(MAKE) release
 	@printf "$(BLUE)⟳ Pushing to $(ORIGIN)...$(NC)\n"
 	git push $(ORIGIN) $(BRANCH) --force-with-lease || { echo; printf "$(YELLOW)⚠ Push rejected. This usually means someone else pushed to $(ORIGIN)/$(BRANCH) while you were rebasing. Try:$(NC)\n"; printf "  git fetch $(ORIGIN) && git rebase $(ORIGIN)/$(BRANCH) && git push $(ORIGIN) $(BRANCH) --force-with-lease\n"; exit 1; }
 	@printf "$(GREEN)✓ $(BRANCH) synced with upstream (clean history)$(NC)\n"
-	@$(MAKE) release
 
 # --- Build targets ---
 
@@ -135,12 +135,28 @@ release:
 
 deploy:
 ifneq ($(DEPLOY_DIR),)
-	@printf "$(BLUE)⟳ Deploying to $(DEPLOY_DIR)...$(NC)\n"
-	sudo mkdir -p $(DEPLOY_DIR)
-	-sudo systemctl stop llama.cpp 2>/dev/null
-	sleep 1
-	sudo cp -r $(BUILD_DIR)/bin/* $(DEPLOY_DIR)/
-	@printf "$(GREEN)✓ Deployed to $(DEPLOY_DIR)$(NC)\n"
+	@set -eu; \
+	parent=$$(dirname -- "$(DEPLOY_DIR)"); \
+	sudo mkdir -p -- "$$parent"; \
+	stage=$$(sudo mktemp -d "$$parent/.cachy-llama-stage.XXXXXX"); \
+	backup="$$parent/.cachy-llama-backup-$$$$"; \
+	old_present=0; new_deployed=0; service_stopped=0; \
+	rollback() { \
+		if [ "$$new_deployed" -eq 1 ]; then sudo rm -rf -- "$(DEPLOY_DIR)"; fi; \
+		sudo rm -rf -- "$$stage"; \
+		if [ "$$old_present" -eq 1 ]; then sudo mv -- "$$backup" "$(DEPLOY_DIR)"; fi; \
+		if [ "$$service_stopped" -eq 1 ]; then sudo systemctl restart llama.cpp || true; fi; \
+	}; \
+	trap rollback EXIT; \
+	sudo cp -a "$(BUILD_DIR)/." "$$stage/"; \
+	sudo test -x "$$stage/llama-server"; \
+	sudo systemctl stop llama.cpp; service_stopped=1; \
+	if sudo test -e "$(DEPLOY_DIR)"; then sudo mv -- "$(DEPLOY_DIR)" "$$backup"; old_present=1; fi; \
+	sudo mv -- "$$stage" "$(DEPLOY_DIR)"; new_deployed=1; \
+	sudo systemctl restart llama.cpp; service_stopped=0; \
+	trap - EXIT; \
+	sudo rm -rf -- "$$backup"; \
+	printf "$(GREEN)✓ Deployed to $(DEPLOY_DIR) and restarted llama.cpp$(NC)\n"
 endif
 
 restart:
@@ -150,13 +166,20 @@ restart:
 	sudo systemctl status llama.cpp --no-pager -l | head -10
 
 debug:
-	@$(CMAKE) -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_FLAGS)
+	@$(CMAKE) -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_BACKEND_FLAGS)
 	@$(CMAKE) --build $(BUILD_DIR) -j $(PARALLEL)
 
 # --- Housekeeping ---
 
 clean:
-	@rm -rf $(BUILD_DIR)
+	@set -eu; \
+	repo_dir=$$(pwd -P); \
+	build_dir=$$(realpath -m -- "$(BUILD_DIR)"); \
+	case "$$build_dir" in \
+		"$$repo_dir"/*) ;; \
+		*) echo "Refusing to remove BUILD_DIR outside the repository: $(BUILD_DIR)" >&2; exit 1 ;; \
+	esac; \
+	rm -rf -- "$(BUILD_DIR)"
 	@printf "$(YELLOW)✓ Removed $(BUILD_DIR)/$(NC)\n"
 
 rebuild: clean release

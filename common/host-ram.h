@@ -23,9 +23,9 @@
 namespace common {
 
 // True and sets *out_bytes to currently available RAM (free + reclaimable) on
-// supported platforms. False (and *out_bytes = 0) when the answer is unreliable
-// (Windows, exotic platforms, kernel older than 3.14, sysinfo() failure).
-// Out param must be non-null.
+// supported platforms. Linux falls back to sysinfo().freeram when MemAvailable
+// is unavailable. False (and *out_bytes = 0) only when neither query works or
+// the platform is unsupported. Out param must be non-null.
 bool host_available_ram_query(std::size_t * out_bytes);
 
 // Currently available RAM in bytes. On Linux/macOS this is the reclaimable
