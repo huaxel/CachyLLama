@@ -127,7 +127,7 @@ bool host_available_ram_query(std::size_t * out_bytes) {
     {
         std::lock_guard<std::mutex> lock(g_ram_cache.mutex);
         g_ram_cache.last_query = std::chrono::steady_clock::now();
-        g_ram_cache.cached     = true;
+        g_ram_cache.cached     = known;
         g_ram_cache.known      = known;
         g_ram_cache.bytes      = *out_bytes;
     }
