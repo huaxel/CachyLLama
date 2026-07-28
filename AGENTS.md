@@ -1,7 +1,7 @@
 # AGENTS.md
 
-**Version:** 1.0
-**Date:** 2026-05-07
+**Version:** 1.1
+**Date:** 2026-07-28
 **Purpose:** Technical reference for llama.cpp development (methodology in .clio/instructions.md)
 
 ---
@@ -360,6 +360,47 @@ CachyLLama diverges from `upstream/master` by tracking these third-party works. 
 CachyLLama focuses downstream: if a third-party patch lands upstream cleanly, the CachyLLama copy can be dropped on the next `merge upstream/master` and the local additions (memory gate, env overrides, follow-up fixes) rebased onto the upstream version. When a third-party patch does not get upstreamed, CachyLLama carries it indefinitely — re-check upstream status each merge in case the situation changes.
 
 Watch upstream #24127 (CUDA MMQ refactor) when bumping: it added `static_assert((I_) % 32 == 0)` to the CASE macro, so any new rdna3_5 config carried from `gaetan-puleo/llama-cpp-strix-halo-patches` must keep I as a multiple of 32. The Strix Halo entry's `71d1e8f2f` follow-up encodes this constraint.
+
+## Fork rationale (huaxel/CachyLLama)
+
+`huaxel/CachyLLama` is a downstream fork of `fewtarius/CachyLLama` carrying local-only patches. As of the last sync with `upstream/master` (2026-07-25), the fork is **6 commits / ~719 insertions ahead**. Every commit is exercised on the production deployment described below.
+
+### Fork delta
+
+| Commit | What | Why fork-local (not PR'd yet) | Live on prod? |
+|--------|------|-------------------------------|---------------|
+| `4242ead82` | Multimodal SSD guard: `get_tokens()` → `get_text_tokens()`, `!has_mtmd` on SSD restore paths | Text-keyed cache cannot validate media embeddings; upstream doesn't have SSD cache multimodal guards. | ✅ Model is `image-text-to-text`; `get_tokens()` would assert on every request. |
+| `cfacfbfa9` | Remove dead `kv_page_manager`, consolidate SSD cache, add MoE tests, TTL host-RAM | Dead code removal, new tests, TTL feature — upstream hasn't reviewed. | ✅ Smaller codebase, MoE regression coverage. |
+| `898d0d24e` | Rename `ssd_page_manager` → `ssd_cache_manager`, fix AGENTS.md Strix Halo status | Cosmetic rename matching class rename; upstream hasn't reviewed. | ✅ Baked into binary. |
+| `cb2ead9b2` | SSD hardening: exact-match-only restore, `seq_pos_max` guard, v4 format, multimodal/safety guards, atomic deploy | Hardening built on fork-only SSD code. Includes `host-ram` bugfix, `kv-ssd-posix` mutex, new `test-ssd-system-cache`. | ✅ 97+ SSD checkpoints active; exact-match-only prevents corrupt state restores. |
+| `65215131c` | `deploy`/`restart`/`clean` Makefile hardening | CachyLLama-specific deployment; atomic swap + rollback. | ✅ `make deploy` used to push to production. |
+| `114537b7b` | `make sync` routine | Minor Makefile refactor; not submitted upstream. | ✅ Used for rebase workflow. |
+
+### Production deployment
+
+The fork is deployed to `/opt/cachy-llama/bin/` via systemd drop-in (`/etc/systemd/system/llama.cpp.service.d/20-cachy-llama.conf`):
+
+```
+ExecStart=/opt/cachy-llama/bin/llama-server $LLAMA_ARGS
+```
+
+Running configuration (as of 2026-07-28):
+- **Model:** Qwen3.6-35B-A3B-MTP (MoE, `image-text-to-text` modality)
+- **SSD cache:** `/mnt/ai_models/cachy-kv-cache/qwen3_6-35b-a3b-mtp` with 97+ checkpoints
+- **GPU:** Vulkan0, `--n-gpu-layers all`
+- **Context:** 131072 tokens, `--ubatch-size 1024`
+- **Speculative decoding:** MTP draft, `--draft-p-min 0.3`
+- **Hybrid SWA:** `--swa-full --swa-checkpoints 64`
+- **Host RAM:** 62 GiB total (`--cache-ssd-hot-ram 16384 --cache-ssd-warm-ram 32768`)
+- **Threads:** `--threads 14 --threads-batch 28`
+
+### Rebase cost
+
+Every `make sync` against `upstream/master` risks conflicts in `tools/server/server-context.cpp`, `common/kv-ssd-*`, and `Makefile`. Recent sync cost ~12 minutes (two conflict resolutions + build + test). The SSD cache code sees active upstream development, so conflicts are expected.
+
+### Reduction strategy
+
+Before submitting PRs to `fewtarius/CachyLLama`, the host-ram bugfix (`cb2ead9b2`) and the `make sync` tweak (`114537b7b`) are the smallest, most-concrete candidates — they'd reduce the rebase conflict surface with zero downside. The SSD hardening and multimodal guards are more invasive and should be submitted as a coherent set when time permits.
 
 ---
 
