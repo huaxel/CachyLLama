@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 fewtarius
 
 #undef NDEBUG
@@ -46,7 +46,12 @@ static llama_moe_coact::matrix make_matrix(int n_layer, int n_expert) {
 }
 
 #if defined(__linux__)
-static void test_residency_evicts_mmap_page() {
+// Eviction madvise()s the expert's pages with MADV_FREE, not MADV_DONTNEED
+// (see 8edfad218: DONTNEED forced immediate reclaim and cost 3.8x on prompt
+// eval). MADV_FREE leaves the contents intact until the kernel is actually
+// short on memory, so this test checks the bookkeeping and that the madvise
+// target range is valid - not that the page reads back as zero.
+static void test_residency_evicts_lru_expert() {
     const size_t page_size = (size_t) getpagesize();
     auto * data = (uint8_t *) mmap(nullptr, 2 * page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(data != MAP_FAILED);
@@ -66,6 +71,7 @@ static void test_residency_evicts_mmap_page() {
     assert(state.total_evicted == 1);
     assert(state.layers[0].slot_of[0] == -1);
     assert(state.layers[0].slot_of[1] == 0);
+
     munmap(data, 2 * page_size);
 }
 #endif
@@ -115,7 +121,7 @@ static void test_coactivation_predicts_same_and_next_layer_experts() {
 
 int main() {
 #if defined(__linux__)
-    test_residency_evicts_mmap_page();
+    test_residency_evicts_lru_expert();
 #endif
     test_residency_tracks_selection_hits_and_invalid_experts();
     test_coactivation_predicts_same_and_next_layer_experts();
