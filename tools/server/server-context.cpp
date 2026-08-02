@@ -941,6 +941,12 @@ private:
     // Per-slot system prompt hash tracking (dedupe extraction)
     std::unordered_map<int, uint64_t> slot_sys_hash;
 
+    // Per-slot system prompt boundary for the slot's current task, in tokens.
+    // 0 = not applicable (no sys cache, multimodal, boundary not detected or
+    // too short to be worth storing). Cached because detection scans the whole
+    // prompt and the prefill loop consults it per batch.
+    std::unordered_map<int, int> slot_sys_n;
+
     // Monotonic turn counter for SSD cache tiering (incremented per slot release)
     uint32_t ssd_turn_counter = 0;
 
@@ -2049,6 +2055,10 @@ private:
         slot.task = std::make_unique<const server_task>(std::move(task));
         slot.user_id_ = slot.task->user_id; // remember owner for affinity + counter release
 
+        // The system boundary is a property of the task, not the slot.
+        slot_sys_n.erase(slot.id);
+        slot_sys_hash.erase(slot.id);
+
         // Compute a stable conversation namespace from the initial text
         // prefix. All checkpoints in a conversation reuse this namespace;
         // full token validation still happens before restoring state.
@@ -2719,8 +2729,10 @@ private:
         // state in memory only; never persist it in the text-keyed SSD cache.
         if (ssd_cache_manager && !slot.prompt.tokens.has_mtmd &&
             (!slot.task || !slot.task->tokens.has_mtmd)) {
-            const auto & prefix_tokens = slot.prompt.tokens;
-            const llama_tokens prefix_text = prefix_tokens.get_text_tokens();
+            // get_tokens() (a reference, no copy): the has_mtmd guard above is
+            // exactly its precondition, and for a text-only container it is
+            // identical to get_text_tokens().
+            const llama_tokens & prefix_text = slot.prompt.tokens.get_tokens();
             ssd_cache_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur,
                 prefix_text.data(),
@@ -2774,7 +2786,7 @@ private:
 
         if (ssd_cache_manager && slot.task && !slot.task->tokens.has_mtmd &&
             !slot.prompt.tokens.has_mtmd) {
-            const llama_tokens prefix_tokens = slot.task->tokens.get_text_tokens();
+            const llama_tokens & prefix_tokens = slot.task->tokens.get_tokens();
             ssd_cache_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
                 prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
@@ -2782,13 +2794,65 @@ private:
         }
     }
 
-    // Try to restore the system prompt section from the global SSD KV cache.
-    // Returns the n_past value after restoration (-1 on failure).
-    // Check if this slot's current prompt represents a system prompt
-    // that should be stored in the global cache.
+    // MIN_USEFUL_SYS_TOKENS: don't cache trivial system sections (chat
+    // template header with no actual system message). The per-conversation
+    // SSD cache handles those. This also keeps false-positive boundary
+    // detection from filling the system cache with near-empty entries.
+    static const int32_t MIN_USEFUL_SYS_TOKENS = 16;
+
+    // Token count of the system section of this slot's current task, or 0 if
+    // there is nothing worth caching. Computed once per task and memoized:
+    // detection scans the whole prompt, and the prefill loop asks per batch.
+    int sys_boundary_for(server_slot & slot) {
+        auto it = slot_sys_n.find(slot.id);
+        if (it != slot_sys_n.end()) {
+            return it->second;
+        }
+
+        int n_sys = 0;
+
+        // A text-token key cannot validate media embeddings, so multimodal
+        // tasks never participate in the system cache.
+        if (sys_cache && ssd_cache_manager && slot.task &&
+            !slot.task->tokens.has_mtmd && !slot.prompt.tokens.has_mtmd) {
+            const llama_tokens & tokens = slot.task->tokens.get_tokens();
+            if (!tokens.empty()) {
+                const int detected = kv_detect_system_prompt_boundary(
+                    llama_model_get_vocab(llama_get_model(ctx_tgt)),
+                    tokens.data(),
+                    (int32_t)tokens.size(),
+                    params_base.chat_template.empty() ? nullptr : params_base.chat_template.c_str());
+
+                if (detected >= MIN_USEFUL_SYS_TOKENS && detected < (int32_t)tokens.size() &&
+                    detected <= (int32_t)KV_SSD_SYS_TOKEN_MAX) {
+                    n_sys = detected;
+                }
+            }
+        }
+
+        slot_sys_n[slot.id] = n_sys;
+        return n_sys;
+    }
+
+    // Store this slot's system prompt KV state in the global cross-conversation
+    // cache.
+    //
+    // Must be called from the prefill loop *before* llama_decode() of the batch
+    // that starts at the system boundary: at that point the sequence holds
+    // exactly tokens [0, n_sys) and nothing more. Calling it once the whole
+    // prompt has been decoded would store the full prompt's state under a key
+    // covering only the system section, and restoring that on a later request
+    // injects KV the request never asked for. The seq_pos_max check below
+    // enforces the precondition rather than trusting the call site.
     void maybe_extract_system_prompt(server_slot & slot) {
-        if (!sys_cache || !ssd_cache_manager || !slot.task ||
-            slot.task->tokens.has_mtmd || slot.prompt.tokens.has_mtmd) {
+        const int n_sys = sys_boundary_for(slot);
+        if (n_sys == 0) {
+            return;
+        }
+
+        // n_sys > 0 already implies this, but the memoized value was computed
+        // earlier in the task - re-check before taking the get_tokens() path.
+        if (!slot.task || slot.task->tokens.has_mtmd) {
             return;
         }
 
@@ -2798,37 +2862,15 @@ private:
             return;
         }
 
-        const auto tokens = slot.task->tokens.get_text_tokens();
-        if (tokens.empty()) {
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_max != n_sys - 1) {
+            SLT_DBG(slot, "skip system prompt store: seq_pos_max=%d, expected %d\n",
+                    pos_max, n_sys - 1);
             return;
         }
 
-        int n_sys = kv_detect_system_prompt_boundary(
-            llama_model_get_vocab(llama_get_model(ctx_tgt)),
-            tokens.data(),
-            (int32_t)tokens.size(),
-            params_base.chat_template.empty() ? nullptr : params_base.chat_template.c_str());
-
-        if (n_sys <= 0 || n_sys >= (int32_t)tokens.size()) {
-            slot_sys_hash[slot.id] = 1;  // mark as checked, nothing to do
-            return;
-        }
-
-        // MIN_USEFUL_SYS_TOKENS: don't cache trivial system sections
-        // (chat template header with no actual system message). The
-        // per-conversation SSD cache handles these cases. This also
-        // prevents false-positive boundary detection from filling
-        // the system cache with near-empty entries.
-        const int32_t MIN_USEFUL_SYS_TOKENS = 16;
-        if (n_sys < MIN_USEFUL_SYS_TOKENS) {
-            slot_sys_hash[slot.id] = 1;
-            return;
-        }
-
-        // The state must have been captured immediately after the system
-        // prompt. This hook normally runs after the full prompt, so refuse
-        // to store unless the sequence position proves the boundary.
-        if (llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != n_sys - 1) {
+        const llama_tokens & tokens = slot.task->tokens.get_tokens();
+        if ((int32_t)tokens.size() <= n_sys) {
             slot_sys_hash[slot.id] = 1;
             return;
         }
@@ -2868,6 +2910,7 @@ private:
 
         // Clean up per-slot state
         slot_sys_hash.erase(slot.id);
+        slot_sys_n.erase(slot.id);
     }
 
     void process_single_task(server_task && task) {
@@ -3665,7 +3708,7 @@ private:
                         // Skip for multimodal: text-token match could restore a checkpoint
                         // whose KV holds different image embeddings.
                         if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_cache_manager && !slot.task->tokens.has_mtmd) {
-                            const auto task_tokens = slot.task->tokens.get_text_tokens();
+                            const llama_tokens & task_tokens = slot.task->tokens.get_tokens();
                             if (!task_tokens.empty()) {
                                 int32_t ssd_pos_min = 0, ssd_pos_max = 0;
                                 uint64_t ssd_n_tokens = 0;
@@ -3776,7 +3819,7 @@ private:
                         // Warm slots (n_tokens > 0) already have full context from
                         // the in-memory prompt cache LCP restore or previous turn.
                         if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_cache_manager && !slot.task->tokens.has_mtmd) {
-                            const auto task_tokens = slot.task->tokens.get_text_tokens();
+                            const llama_tokens & task_tokens = slot.task->tokens.get_tokens();
                             int n_sys = kv_detect_system_prompt_boundary(
                                 llama_model_get_vocab(llama_get_model(ctx_tgt)),
                                 task_tokens.data(),
@@ -4090,7 +4133,7 @@ private:
                             // Skip for multimodal: text-token keys cannot validate
                             // media embeddings, and get_tokens() asserts !has_mtmd.
                             if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_cache_manager && !slot.task->tokens.has_mtmd) {
-                                const auto   task_tokens = slot.task->tokens.get_text_tokens();
+                                const llama_tokens & task_tokens = slot.task->tokens.get_tokens();
                                 int n_sys = kv_detect_system_prompt_boundary(
                                     llama_model_get_vocab(llama_get_model(ctx_tgt)),
                                     task_tokens.data(),
@@ -4295,12 +4338,25 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // End a batch exactly at the system prompt boundary so the
+                    // sequence state can be snapshotted there for the global
+                    // system cache (see maybe_extract_system_prompt). Only
+                    // relevant while the boundary is still ahead of us: a warm
+                    // slot that already covers the system section skips this.
+                    const int sys_n = sys_boundary_for(slot);
+                    const bool sys_split = sys_n > 0 && slot.prompt.n_tokens() < sys_n &&
+                                           slot_sys_hash.find(slot.id) == slot_sys_hash.end();
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
                             break; // end of text chunk
+                        }
+
+                        if (sys_split && slot.prompt.n_tokens() == sys_n) {
+                            break;
                         }
 
                         // if this is an alora request with pre-invocation
@@ -4364,12 +4420,17 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
+                    // Extract the system prompt for the cross-conversation SSD
+                    // cache. Runs before llama_decode() of this batch, so when
+                    // the batch starts at the boundary the sequence holds
+                    // exactly the system tokens and nothing else.
+                    if (sys_n > 0 && n_tokens_start == sys_n) {
+                        maybe_extract_system_prompt(slot);
+                    }
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
-
-                        // Extract system prompt for cross-conversation SSD cache
-                        maybe_extract_system_prompt(slot);
 
                         GGML_ASSERT(batch.size() > 0);
 
@@ -5548,6 +5609,7 @@ void server_routes::init_routes() {
         std::string prompt = json_value(data, "prompt", std::string());
         std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
         SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
+
         data["prompt"] = format_prompt_infill(
             ctx_server.vocab,
             data.at("input_prefix"),
@@ -5557,7 +5619,10 @@ void server_routes::init_routes() {
             params.n_predict,
             meta->slot_n_ctx,
             params.spm_infill,
-            tokenized_prompts[0].get_text_tokens() // text-only tokens: mtmd-safe (get_tokens asserts !has_mtmd)
+            // "prompt" is validated as a string above, and a string subprompt is
+            // always built with has_mtmd=false - so get_tokens() holds and its
+            // assert keeps that invariant honest if the route ever gains media.
+            tokenized_prompts[0].get_tokens()
         );
 
         std::vector<raw_buffer> files; // dummy

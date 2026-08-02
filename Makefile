@@ -148,8 +148,10 @@ ifneq ($(DEPLOY_DIR),)
 		if [ "$$service_stopped" -eq 1 ]; then sudo systemctl restart llama.cpp || true; fi; \
 	}; \
 	trap rollback EXIT; \
-	sudo cp -a "$(BUILD_DIR)/." "$$stage/"; \
+	sudo test -x "$(BUILD_DIR)/bin/llama-server"; \
+	sudo cp -a "$(BUILD_DIR)/bin/." "$$stage/"; \
 	sudo test -x "$$stage/llama-server"; \
+	sudo chmod 755 -- "$$stage"; \
 	sudo systemctl stop llama.cpp; service_stopped=1; \
 	if sudo test -e "$(DEPLOY_DIR)"; then sudo mv -- "$(DEPLOY_DIR)" "$$backup"; old_present=1; fi; \
 	sudo mv -- "$$stage" "$(DEPLOY_DIR)"; new_deployed=1; \
