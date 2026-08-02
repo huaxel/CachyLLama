@@ -405,7 +405,10 @@ static size_t scan_checkpoint_files(kv_ssd_cache* c) {
         if (load_checkpoint_file(c, filepath)) {
             loaded++;
         } else {
-            LOG_WRN("SSD cache: warning: failed to load %s\n", filepath.c_str());
+            std::error_code ec;
+            fs::remove(filepath, ec);
+            LOG_WRN("SSD cache: warning: failed to load %s; %s\n", filepath.c_str(),
+                    ec ? ec.message().c_str() : "removed");
         }
     }
     return loaded;
@@ -764,6 +767,11 @@ kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t c
 
     // Scan checkpoint files to rebuild in-memory index
     size_t loaded = scan_checkpoint_files(c);
+    for (const auto & [id, ckpt] : c->index) {
+        if (id >= c->next_id && id != UINT64_MAX) {
+            c->next_id = id + 1;
+        }
+    }
     LOG_INF("SSD cache: loaded %zu checkpoints from %s (next_id=%lu)\n",
             loaded, c->model_dir.c_str(), (unsigned long)c->next_id);
 
