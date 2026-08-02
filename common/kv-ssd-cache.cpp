@@ -8,6 +8,7 @@
 
 #include "log.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <algorithm>
@@ -156,15 +157,29 @@ static bool read_index_file(kv_ssd_cache* c) {
     return true;
 }
 
+enum ckpt_load_result {
+    CKPT_LOAD_OK,
+    CKPT_LOAD_STALE,  // readable, but written by a different format version
+    CKPT_LOAD_ERROR,  // could not be read; may be transient, leave the file alone
+};
+
 // Load a single checkpoint file into the in-memory index.
-static bool load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
+static ckpt_load_result load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
     int fd = open(filepath.c_str(), O_RDONLY);
-    if (fd < 0) return false;
+    if (fd < 0) return CKPT_LOAD_ERROR;
 
     kv_ssd_record rec;
     bool ok = pread_all(fd, &rec, sizeof(rec), 0);
     close(fd);
-    if (!ok || rec.magic != KV_SSD_MAGIC_REC || rec.version != KV_SSD_VERSION) return false;
+    if (!ok || rec.magic != KV_SSD_MAGIC_REC) return CKPT_LOAD_ERROR;
+
+    // Records from an older format version are not interchangeable with the
+    // current one - v3 keyed checkpoints on get_tokens() (media placeholders
+    // included), v4 on text tokens only. Matching a v3 key against a v4 query
+    // can restore KV state that does not correspond to the request.
+    if (rec.version != KV_SSD_VERSION) {
+        return CKPT_LOAD_STALE;
+    }
 
     // Build index entry
     kv_ssd_checkpoint ckpt;
@@ -191,7 +206,7 @@ static bool load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
 
     c->index[rec.id] = ckpt;
     c->slot_latest[rec.slot_id] = rec.id;
-    return true;
+    return CKPT_LOAD_OK;
 }
 
 // Scan the model directory for ckpt-*.bin files and load their headers.
@@ -201,21 +216,51 @@ static size_t scan_checkpoint_files(kv_ssd_cache* c) {
     if (!fs::exists(dir) || !fs::is_directory(dir)) return 0;
 
     size_t loaded = 0;
+    size_t stale  = 0;
     for (const auto& entry : fs::directory_iterator(dir)) {
         std::string fname = entry.path().filename().string();
         if (fname.size() < 9) continue;
         if (fname.compare(0, 5, "ckpt-") != 0) continue;
         if (fname.compare(fname.size() - 4, 4, ".bin") != 0) continue;
 
-        std::string filepath = (dir / fname).string();
-        if (load_checkpoint_file(c, filepath)) {
-            loaded++;
-        } else {
-            std::error_code ec;
-            fs::remove(filepath, ec);
-            LOG_WRN("SSD cache: warning: failed to load %s; %s\n", filepath.c_str(),
-                    ec ? ec.message().c_str() : "removed");
+        // Reserve every id that exists on disk, including ids whose record
+        // failed to load. next_id comes from the index file, which can be
+        // missing, truncated or written by an older format version - without
+        // this, next_id restarts at 1 and the next store overwrites a live
+        // checkpoint file while its index entry still points at the old data.
+        const std::string id_str = fname.substr(5, fname.size() - 9);
+        if (!id_str.empty() && id_str.find_first_not_of("0123456789") == std::string::npos) {
+            const uint64_t id = strtoull(id_str.c_str(), nullptr, 10);
+            if (id >= c->next_id) {
+                c->next_id = id + 1;
+            }
         }
+
+        std::string filepath = (dir / fname).string();
+        switch (load_checkpoint_file(c, filepath)) {
+            case CKPT_LOAD_OK:
+                loaded++;
+                break;
+            case CKPT_LOAD_STALE:
+                // Nothing else reclaims these: eviction only deletes files that
+                // made it into c->index, so a rejected file would sit on disk
+                // forever. Deleting is safe - a checkpoint from another format
+                // version can never be restored, only re-created.
+                if (unlink(filepath.c_str()) == 0) {
+                    stale++;
+                } else {
+                    LOG_WRN("SSD cache: could not remove stale %s: %s\n",
+                            filepath.c_str(), strerror(errno));
+                }
+                break;
+            case CKPT_LOAD_ERROR:
+                LOG_WRN("SSD cache: warning: failed to load %s\n", filepath.c_str());
+                break;
+        }
+    }
+    if (stale > 0) {
+        LOG_INF("SSD cache: removed %zu checkpoints from an older format version (now v%u)\n",
+                stale, KV_SSD_VERSION);
     }
     return loaded;
 }
@@ -534,11 +579,6 @@ kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t c
 
     // Scan checkpoint files to rebuild in-memory index
     size_t loaded = scan_checkpoint_files(c);
-    for (const auto & [id, ckpt] : c->index) {
-        if (id >= c->next_id && id != UINT64_MAX) {
-            c->next_id = id + 1;
-        }
-    }
     LOG_INF("SSD cache: loaded %zu checkpoints from %s (next_id=%lu)\n",
             loaded, c->model_dir.c_str(), (unsigned long)c->next_id);
 
