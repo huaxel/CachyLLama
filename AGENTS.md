@@ -373,7 +373,7 @@ Watch upstream #24127 (CUDA MMQ refactor) when bumping: it added `static_assert(
 | `cfacfbfa9` | Remove dead `kv_page_manager`, consolidate SSD cache, add MoE tests, TTL host-RAM | Dead code removal, new tests, TTL feature — upstream hasn't reviewed. | ✅ Smaller codebase, MoE regression coverage. |
 | `898d0d24e` | Rename `ssd_page_manager` → `ssd_cache_manager`, fix AGENTS.md Strix Halo status | Cosmetic rename matching class rename; upstream hasn't reviewed. | ✅ Baked into binary. |
 | `cb2ead9b2` | SSD hardening: exact-match-only restore, `seq_pos_max` guard, v4 format, multimodal/safety guards, atomic deploy | Hardening built on fork-only SSD code. Includes `host-ram` bugfix, `kv-ssd-posix` mutex, new `test-ssd-system-cache`. | ✅ 97+ SSD checkpoints active; exact-match-only prevents corrupt state restores. |
-| `65215131c` | `deploy`/`restart`/`clean` Makefile hardening | CachyLLama-specific deployment; atomic swap + rollback. | ✅ `make deploy` used to push to production. |
+| `65215131c` | `deploy`/`restart`/`clean` Makefile hardening | CachyLLama-specific deployment; atomic swap + rollback. | ⚠️ Not yet exercised. `/opt/cachy-llama/bin` was last written 2026-07-22, before this target existed; the recipe staged `$(BUILD_DIR)/.` instead of `$(BUILD_DIR)/bin/.` and would have aborted on its own `test -x`. Fixed, but still unrun against prod. |
 | `114537b7b` | `make sync` routine | Minor Makefile refactor; not submitted upstream. | ✅ Used for rebase workflow. |
 
 ### Production deployment
