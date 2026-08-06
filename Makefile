@@ -78,6 +78,9 @@ NC := \033[0m
 # --- Sync with upstream ---
 
 sync-merge:
+	@if test -n "$$(git status --porcelain)"; then \
+		echo "Refusing to sync with a dirty working tree" >&2; exit 1; \
+	fi
 	@printf "$(BLUE)⟳ Fetching $(UPSTREAM)...$(NC)\n"
 	git fetch $(UPSTREAM)
 	@printf "$(BLUE)⟳ Merging $(UPSTREAM)/$(BRANCH) into $(BRANCH)...$(NC)\n"
@@ -88,6 +91,9 @@ sync-merge:
 	@printf "$(GREEN)✓ $(BRANCH) synced with upstream$(NC)\n"
 
 sync:
+	@if test -n "$$(git status --porcelain)"; then \
+		echo "Refusing to sync with a dirty working tree" >&2; exit 1; \
+	fi
 	@printf "$(BLUE)⟳ Fetching $(UPSTREAM)...$(NC)\n"
 	git fetch $(UPSTREAM)
 	@printf "$(BLUE)⟳ Rebasing $(BRANCH) onto $(UPSTREAM)/$(BRANCH)...$(NC)\n"
@@ -105,32 +111,32 @@ all: release
 
 server:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-server -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --target llama-server --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-server$(NC)\n"
 
 cli:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-cli -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --target llama-cli --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-cli$(NC)\n"
 
 bench:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-bench -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --target llama-bench --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-bench$(NC)\n"
 
 quantize:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-quantize -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --target llama-quantize --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-quantize$(NC)\n"
 
 perplexity:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-perplexity -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --target llama-perplexity --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-perplexity$(NC)\n"
 
 release:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --config Release -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --config $(BUILD_TYPE) -j $(PARALLEL)
 	@if [ "$(ENABLE_DEPLOY)" = "1" ]; then $(MAKE) deploy; fi
 
 deploy:
