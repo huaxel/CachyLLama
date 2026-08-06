@@ -365,18 +365,19 @@ Watch upstream #24127 (CUDA MMQ refactor) when bumping: it added `static_assert(
 
 ## Fork rationale (huaxel/CachyLLama)
 
-`huaxel/CachyLLama` is a downstream fork of `fewtarius/CachyLLama` carrying local-only patches. As of the last sync with `upstream/master` (2026-07-25), the fork is **6 commits / ~719 insertions ahead**. Every commit is exercised on the production deployment described below.
+`huaxel/CachyLLama` is a downstream fork of `fewtarius/CachyLLama` carrying local-only patches. As of the last sync with `upstream/master` (2026-08-06, `d84ea1ca2`), the fork is **13 commits ahead** (net +1125/−1980 lines). Every commit is exercised on the production deployment described below.
 
 ### Fork delta
 
 | Commit | What | Why fork-local (not PR'd yet) | Live on prod? |
 |--------|------|-------------------------------|---------------|
-| `4242ead82` | Multimodal SSD guard: `get_tokens()` → `get_text_tokens()`, `!has_mtmd` on SSD restore paths | Text-keyed cache cannot validate media embeddings; upstream doesn't have SSD cache multimodal guards. | ✅ Model is `image-text-to-text`; `get_tokens()` would assert on every request. |
-| `cfacfbfa9` | Remove dead `kv_page_manager`, consolidate SSD cache, add MoE tests, TTL host-RAM | Dead code removal, new tests, TTL feature — upstream hasn't reviewed. | ✅ Smaller codebase, MoE regression coverage. |
-| `898d0d24e` | Rename `ssd_page_manager` → `ssd_cache_manager`, fix AGENTS.md Strix Halo status | Cosmetic rename matching class rename; upstream hasn't reviewed. | ✅ Baked into binary. |
-| `cb2ead9b2` | SSD hardening: exact-match-only restore, `seq_pos_max` guard, v4 format, multimodal/safety guards, atomic deploy | Hardening built on fork-only SSD code. Includes `host-ram` bugfix, `kv-ssd-posix` mutex, new `test-ssd-system-cache`. | ✅ 97+ SSD checkpoints active; exact-match-only prevents corrupt state restores. |
-| `65215131c` | `deploy`/`restart`/`clean` Makefile hardening | CachyLLama-specific deployment; atomic swap + rollback. | ⚠️ Not yet exercised. `/opt/cachy-llama/bin` was last written 2026-07-22, before this target existed; the recipe staged `$(BUILD_DIR)/.` instead of `$(BUILD_DIR)/bin/.` and would have aborted on its own `test -x`. Fixed, but still unrun against prod. |
-| `114537b7b` | `make sync` routine | Minor Makefile refactor; not submitted upstream. | ✅ Used for rebase workflow. |
+| `c32dc4dc4` | Multimodal SSD guard: `get_tokens()` → `get_text_tokens()`, `!has_mtmd` on SSD restore paths | Text-keyed cache cannot validate media embeddings; upstream doesn't have SSD cache multimodal guards. | ✅ Model is `image-text-to-text`; `get_tokens()` would assert on every request. |
+| `66f8f76fb` | Remove dead `kv_page_manager`, consolidate SSD cache, add MoE tests, TTL host-RAM | Dead code removal, new tests, TTL feature — upstream hasn't reviewed. | ✅ Smaller codebase, MoE regression coverage. |
+| `116660728` | Rename `ssd_page_manager` → `ssd_cache_manager`, fix AGENTS.md Strix Halo status | Cosmetic rename matching class rename; upstream hasn't reviewed. | ✅ Baked into binary. |
+| `2cac39964` | SSD hardening: exact-match-only restore, `seq_pos_max` guard, v4 format, multimodal/safety guards, atomic deploy | Hardening built on fork-only SSD code. Includes `host-ram` bugfix, `kv-ssd-posix` mutex, new `test-ssd-system-cache`. | ✅ 97+ SSD checkpoints active; exact-match-only prevents corrupt state restores. |
+| `b6b882749` | `deploy`/`restart`/`clean` Makefile hardening | CachyLLama-specific deployment; atomic swap + rollback. | ⚠️ Not yet exercised. `/opt/cachy-llama/bin` was last written 2026-07-22, before this target existed; the recipe staged `$(BUILD_DIR)/.` instead of `$(BUILD_DIR)/bin/.` and would have aborted on its own `test -x`. Fixed, but still unrun against prod. |
+| `d56cb4583` | `make sync` routine | Minor Makefile refactor; not submitted upstream. | ✅ Used for rebase workflow. |
+| `9c7698b22` | Drop duplicate `common_get_model_or_exit` / `SRV_TRC` left by rebase auto-merge | Rebase artifact cleanup; not submitted upstream. | ✅ Built and tested. |
 
 ### Production deployment
 
@@ -402,7 +403,7 @@ Every `make sync` against `upstream/master` risks conflicts in `tools/server/ser
 
 ### Reduction strategy
 
-Before submitting PRs to `fewtarius/CachyLLama`, the host-ram bugfix (`cb2ead9b2`) and the `make sync` tweak (`114537b7b`) are the smallest, most-concrete candidates — they'd reduce the rebase conflict surface with zero downside. The SSD hardening and multimodal guards are more invasive and should be submitted as a coherent set when time permits.
+Before submitting PRs to `fewtarius/CachyLLama`, the host-ram bugfix (`2cac39964`) and the `make sync` tweak (`d56cb4583`) are the smallest, most-concrete candidates — they'd reduce the rebase conflict surface with zero downside. The SSD hardening and multimodal guards are more invasive and should be submitted as a coherent set when time permits.
 
 ---
 
