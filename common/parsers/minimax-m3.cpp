@@ -111,7 +111,13 @@ common_chat_params common_chat_params_init_minimax_m3(const common_chat_template
                            const std::string & close) -> common_peg_parser {
                 auto close_tag = p.tool_arg_close(p.literal(close));
 
-                // A string accepts anything, so a union with a string alternative is a string
+                // A string accepts anything, so a union with a string alternative is a string.
+                // BUT: if the schema carries an enum/const/pattern/etc., fall through to the
+                // schema-based path so the model is constrained to valid values instead of
+                // emitting arbitrary raw strings.
+                if (schema.is_constrained_string()) {
+                    return p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, schema)) + close_tag;
+                }
                 if (schema.may_be_string()) {
                     return p.ac(p.tool_arg_string_value(p.until(close)) + close_tag, close);
                 }

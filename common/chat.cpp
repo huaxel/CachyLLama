@@ -25,6 +25,7 @@
 #include <map>
 
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1448,6 +1449,23 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
                                       const std::string &               input,
                                       bool                              is_partial,
                                       const common_chat_parser_params & params) {
+    // Strip malformed DSML tool-call markers from assistant content. DeepSeek
+    // V3.2/V4 use DSML (<|DSML|tool_calls>, <|DSML|invoke>, <|DSML|parameter>,
+    // etc.) only inside tool-call blocks; any DSML tag that survives in
+    // msg.content means the model emitted malformed tokens (typically when
+    // stuck in a degenerate tool-call-marker loop). The PEG parser correctly
+    // refuses to match these as tool calls, so they fall through to
+    // msg.content. Strip the openers and closers (preserve any body text the
+    // model emitted between them) so downstream clients never see raw DSML.
+    // Tool calls in msg.tool_calls are unaffected.
+    // U+FF5C (FULLWIDTH VERTICAL LINE), UTF-8 = EF BD 9C
+    static const std::regex malformed_dsml_re(
+        "<[/]?" "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c" "[^>]*>",
+        std::regex::optimize);
+    auto sanitize_dsml_content = [](std::string & s) {
+        s = std::regex_replace(std::move(s), malformed_dsml_re, "");
+    };
+
     const common_peg_arena & parser = src_parser.empty() ?
         build_chat_peg_parser([](common_chat_peg_builder & p) { return p.content(p.rest()) + p.end(); }) :
         src_parser;
@@ -1487,6 +1505,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             }
             mapper->from_ast(ctx.ast, result);
 
+            sanitize_dsml_content(msg.content);
+            for (auto & part : msg.content_parts) {
+                sanitize_dsml_content(part.text);
+            }
+
             if (ctx.is_debug()) {
                 fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
                 fflush(stderr);
@@ -1510,6 +1533,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         mapper = std::make_unique<common_chat_peg_mapper>(msg);
     }
     mapper->from_ast(ctx.ast, result);
+
+    sanitize_dsml_content(msg.content);
+    for (auto & part : msg.content_parts) {
+        sanitize_dsml_content(part.text);
+    }
 
     if (ctx.is_debug()) {
         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());

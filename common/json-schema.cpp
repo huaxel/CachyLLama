@@ -480,6 +480,58 @@ bool common_chat_schema::may_be_string() const {
     return may_be_string_impl(*this, visited);
 }
 
+static bool is_constrained_string_impl(const common_chat_schema & s, std::unordered_set<const common_chat_schema *> & visited) {
+    switch (s.kind()) {
+        case common_chat_schema::KIND_STRING: {
+            const auto & str = static_cast<const common_chat_schema_string &>(s);
+            return !str.pattern.empty() || str.format != common_chat_schema::FORMAT_NONE ||
+                str.min_length > 0 || str.max_length >= 0;
+        }
+        case common_chat_schema::KIND_CONST:
+            return static_cast<const common_chat_schema_const &>(s).value.is_string();
+        case common_chat_schema::KIND_ENUM:
+            for (const auto & v : static_cast<const common_chat_schema_enum &>(s).values) {
+                if (v.is_string()) {
+                    return true;
+                }
+            }
+            return false;
+        case common_chat_schema::KIND_REF: {
+            const auto * target = static_cast<const common_chat_schema_ref &>(s).target;
+            if (!target || !visited.insert(target).second) {
+                return false;
+            }
+            bool result = is_constrained_string_impl(*target, visited);
+            visited.erase(target);
+            return result;
+        }
+        case common_chat_schema::KIND_ANY_OF:
+            for (const auto & child : static_cast<const common_chat_schema_any_of &>(s).children) {
+                if (is_constrained_string_impl(*child, visited)) {
+                    return true;
+                }
+            }
+            return false;
+        case common_chat_schema::KIND_ALL_OF:
+            for (const auto & child : static_cast<const common_chat_schema_all_of &>(s).children) {
+                if (child->kind() == common_chat_schema::KIND_ANY) {
+                    continue;
+                }
+                if (is_constrained_string_impl(*child, visited)) {
+                    return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+bool common_chat_schema::is_constrained_string() const {
+    std::unordered_set<const common_chat_schema *> visited;
+    return is_constrained_string_impl(*this, visited);
+}
+
 const char * common_chat_schema::kind_name(node_kind kind) {
     switch (kind) {
         case KIND_ANY:     return "any";
