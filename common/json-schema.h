@@ -83,6 +83,11 @@ struct common_chat_schema {
     // Whether a value matching the schema may be a string, through any branch of it.
     bool may_be_string() const;
 
+    // Whether a string matching the schema carries enum/const/pattern/format/length
+    // constraints (through $ref/oneOf/anyOf/allOf). Constrained strings must go
+    // through the JSON-schema grammar instead of the raw-string path.
+    bool is_constrained_string() const;
+
     static const char * kind_name(node_kind kind);
     static const char * type_name(value_type type);
 };

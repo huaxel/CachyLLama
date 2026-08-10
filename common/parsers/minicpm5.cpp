@@ -75,7 +75,13 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
                 std::vector<common_peg_parser> arg_rules;
                 foreach_parameter(function, [&](const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
                     auto value_parser = p.eps();
-                    if (prop.schema->may_be_string()) {
+                    // Route constrained strings (enum/const/pattern/...) through the
+                    // JSON-schema grammar so the value list is enforced.
+                    if (prop.schema->is_constrained_string()) {
+                        value_parser = p.tool_arg_json_value(
+                                p.schema(p.json(), "tool-" + name + "-arg-" + prop.name + "-schema", doc, *prop.schema)
+                            ) + p.tool_arg_close(p.literal("</param>"));
+                    } else if (prop.schema->may_be_string()) {
                         value_parser = string_value;
                     } else {
                         value_parser = p.tool_arg_json_value(
