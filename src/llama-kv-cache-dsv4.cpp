@@ -703,11 +703,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                         }
                     }
 
-                    if (n_seq_tokens == 0) {
-                        // no-op: copy the snapshot plane onto itself
-                        src = (int32_t) (dst_plane + stream_off + r);
-                    }
-
                     plan.state_snapshot_src_idxs.push_back(src);
                     plan.state_snapshot_dst_idxs.push_back((int32_t) (dst_plane + stream_off + r));
                 }
