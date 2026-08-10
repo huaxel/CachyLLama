@@ -24,6 +24,7 @@
 #include <map>
 
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1204,9 +1205,24 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param_name)) + ">\n");
 
-                    auto arg_value = schema_info.resolves_to_string(param_schema) ?
-                        arg_string :
-                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
+                    // Same constraint-bypass fix as deepseek_v3_2 (see comment there):
+                    // when the schema carries enum/const/pattern/etc., route through the
+                    // JSON-schema grammar so the constrained value list is enforced
+                    // instead of letting the model emit any raw string.
+                    bool is_constrained_string =
+                        schema_info.resolves_to_string(param_schema) &&
+                        (param_schema.contains("enum") ||
+                         param_schema.contains("const") ||
+                         param_schema.contains("pattern") ||
+                         param_schema.contains("format") ||
+                         param_schema.contains("minLength") ||
+                         param_schema.contains("maxLength"));
+
+                    auto arg_value = is_constrained_string ?
+                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close :
+                        schema_info.resolves_to_string(param_schema) ?
+                            arg_string :
+                            p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
 
@@ -2194,10 +2210,29 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
                     bool is_required = required.find(param_name) != required.end();
                     bool is_string   = schema_info.resolves_to_string(param_schema);
 
+                    // Fall back to the JSON-schema-constrained grammar for string
+                    // parameters whenever the schema carries a constraint (enum, const,
+                    // pattern, format, minLength, maxLength). Otherwise the grammar
+                    // degenerates to `until(PARAM_END)` which lets the model emit any
+                    // raw string -- bypassing the enum and producing values like
+                    // `execute_command` instead of `exec`. The non-constrained path is
+                    // preserved for plain strings (most common case) so unquoted
+                    // DSML payloads keep working.
+                    bool is_constrained_string = is_string && (
+                        param_schema.contains("enum") ||
+                        param_schema.contains("const") ||
+                        param_schema.contains("pattern") ||
+                        param_schema.contains("format") ||
+                        param_schema.contains("minLength") ||
+                        param_schema.contains("maxLength"));
+
                     auto arg = p.tool_arg(
                         p.tool_arg_open(p.literal(PARAM_START + " name=\"") + p.tool_arg_name(p.literal(param_name)) +
                                         p.literal("\" string=\"" + std::string(is_string ? "true" : "false") + "\">")) +
-                        (is_string ?
+                        (is_constrained_string ?
+                             p.tool_arg_json_value(p.schema(p.json(), "tool-" + name + "-arg-" + param_name + "-schema",
+                                                            param_schema, false)) :
+                         is_string ?
                              p.tool_arg_string_value(p.until(PARAM_END)) :
                              p.tool_arg_json_value(p.schema(p.json(), "tool-" + name + "-arg-" + param_name + "-schema",
                                                             param_schema, false))) +
@@ -2585,9 +2620,23 @@ static common_chat_params common_chat_params_init_minimax_m3(const common_chat_t
                            const std::string & close) -> common_peg_parser {
                 auto close_tag = p.tool_arg_close(p.literal(close));
 
-                // A string accepts anything, so a union with a string alternative is a string
-                if (schema_info.resolves_to_string(schema)) {
+                // A string accepts anything, so a union with a string alternative is a string.
+                // BUT: if the schema carries an enum/const/pattern/etc., fall through to the
+                // schema-based path so the model is constrained to valid values instead of
+                // emitting arbitrary raw strings (e.g. `execute_command` for `operation`).
+                bool is_constrained_string =
+                    schema_info.resolves_to_string(schema) &&
+                    (schema.contains("enum") ||
+                     schema.contains("const") ||
+                     schema.contains("pattern") ||
+                     schema.contains("format") ||
+                     schema.contains("minLength") ||
+                     schema.contains("maxLength"));
+                if (schema_info.resolves_to_string(schema) && !is_constrained_string) {
                     return p.ac(p.tool_arg_string_value(p.until(close)) + close_tag, close);
+                }
+                if (is_constrained_string) {
+                    return p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", schema, false)) + close_tag;
                 }
 
                 if (auto alternatives = alternatives_of(schema)) {
@@ -3024,7 +3073,23 @@ static common_chat_params common_chat_params_init_minicpm5(const common_chat_tem
                     auto arg_choice = p.choice();
                     for (const auto & [prop_name, prop_schema] : params.at("properties").items()) {
                         auto value_parser = p.eps();
-                        if (schema_info.resolves_to_string(prop_schema)) {
+                        // Same constraint-bypass fix as deepseek_v3_2 / qwen3_coder:
+                        // when the schema carries enum/const/pattern/etc., route through
+                        // the JSON-schema grammar so the constrained value list is
+                        // enforced instead of letting the model emit any raw string.
+                        bool is_constrained_string =
+                            schema_info.resolves_to_string(prop_schema) &&
+                            (prop_schema.contains("enum") ||
+                             prop_schema.contains("const") ||
+                             prop_schema.contains("pattern") ||
+                             prop_schema.contains("format") ||
+                             prop_schema.contains("minLength") ||
+                             prop_schema.contains("maxLength"));
+                        if (is_constrained_string) {
+                            value_parser = p.tool_arg_json_value(
+                                    p.schema(p.json(), "tool-" + name + "-arg-" + prop_name + "-schema", prop_schema, false)
+                                ) + p.tool_arg_close(p.literal("</param>"));
+                        } else if (schema_info.resolves_to_string(prop_schema)) {
                             value_parser = string_value;
                         } else {
                             value_parser = p.tool_arg_json_value(
@@ -3434,6 +3499,25 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
                                       const std::string &               input,
                                       bool                              is_partial,
                                       const common_chat_parser_params & params) {
+    // Strip malformed DSML tool-call markers from assistant content. DeepSeek
+    // V3.2/V4 use DSML (<|DSML|tool_calls>, <|DSML|invoke>, <|DSML|parameter>,
+    // etc.) only inside tool-call blocks; any DSML tag that survives in
+    // msg.content means the model emitted malformed tokens (typically when
+    // stuck in a degenerate tool-call-marker loop, upstream issue #26694:
+    // "DeepSeek-V4-Flash degenerates into repetition and leaks special tokens
+    // in long agentic chats"). The PEG parser correctly refuses to match
+    // these as tool calls, so they fall through to msg.content and clients
+    // render unprintable DSML. Strip the openers and closers (preserve any
+    // body text the model emitted between them) so downstream clients never
+    // see raw DSML. Tool calls in msg.tool_calls are unaffected.
+    // U+FF5C (FULLWIDTH VERTICAL LINE), UTF-8 = EF BD 9C
+    static const std::regex malformed_dsml_re(
+        "<[/]?" "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c" "[^>]*>",
+        std::regex::optimize);
+    auto sanitize_dsml_content = [](std::string & s) {
+        s = std::regex_replace(std::move(s), malformed_dsml_re, "");
+    };
+
     const common_peg_arena & parser = src_parser.empty() ?
         build_chat_peg_parser([](common_chat_peg_builder & p) { return p.content(p.rest()) + p.end(); }) :
         src_parser;
@@ -3473,6 +3557,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             }
             mapper->from_ast(ctx.ast, result);
 
+            sanitize_dsml_content(msg.content);
+            for (auto & part : msg.content_parts) {
+                sanitize_dsml_content(part.text);
+            }
+
             if (ctx.is_debug()) {
                 fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
                 fflush(stderr);
@@ -3496,6 +3585,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         mapper = std::make_unique<common_chat_peg_mapper>(msg);
     }
     mapper->from_ast(ctx.ast, result);
+
+    sanitize_dsml_content(msg.content);
+    for (auto & part : msg.content_parts) {
+        sanitize_dsml_content(part.text);
+    }
 
     if (ctx.is_debug()) {
         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
