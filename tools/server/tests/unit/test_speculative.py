@@ -33,9 +33,9 @@ def test_with_and_without_draft():
         "n_predict": 16,
         "return_tokens": True,
     }
-
     server.model_draft = None  # disable draft model
     server.spec_type = None
+    server.backend_sampling = True
     server.start()
     res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
@@ -44,6 +44,7 @@ def test_with_and_without_draft():
 
     # create new server with draft model
     create_server()
+    server.backend_sampling = True
     server.start()
     res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
