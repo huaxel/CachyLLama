@@ -3507,15 +3507,30 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     // "DeepSeek-V4-Flash degenerates into repetition and leaks special tokens
     // in long agentic chats"). The PEG parser correctly refuses to match
     // these as tool calls, so they fall through to msg.content and clients
-    // render unprintable DSML. Strip the openers and closers (preserve any
-    // body text the model emitted between them) so downstream clients never
-    // see raw DSML. Tool calls in msg.tool_calls are unaffected.
+    // render unprintable DSML. Strip every malformed token (open OR close,
+    // well-formed AND unclosed/orphaned) so downstream clients never see
+    // raw DSML. Tool calls in msg.tool_calls are unaffected.
     // U+FF5C (FULLWIDTH VERTICAL LINE), UTF-8 = EF BD 9C
+    //
+    // Two passes:
+    //   1. Well-formed tags: <[/]?|DSML|XXX>  (single greedy match per
+    //      unclosed/opening/closing/faux-pair token because [^>]* swallows
+    //      everything up to the next `>`, including embedded body and
+    //      adjacent opener/closer fragments when the model lost track of
+    //      the syntax entirely).
+    //   2. Unclosed tokens: <[/]?|DSML|XXX terminated by EOF, newline, or
+    //      the next tag's `<` (covers <|DSML|tool_operations\n and
+    //      </|DSML|parameter with no closing `>` left in the response, the
+    //      pattern observed in the user's reported log).
     static const std::regex malformed_dsml_re(
         "<[/]?" "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c" "[^>]*>",
         std::regex::optimize);
+    static const std::regex unclosed_dsml_re(
+        "<[/]?" "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c" "[^<>]*?(?:$|<|\n)",
+        std::regex::optimize);
     auto sanitize_dsml_content = [](std::string & s) {
         s = std::regex_replace(std::move(s), malformed_dsml_re, "");
+        s = std::regex_replace(std::move(s), unclosed_dsml_re,    "");
     };
 
     const common_peg_arena & parser = src_parser.empty() ?
