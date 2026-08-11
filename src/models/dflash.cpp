@@ -330,7 +330,7 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
         cb(cur, "enc_aux_norm", -1);
     }
 
-    cur = build_lora_mm(model.fc, cur);
+    cur = build_lora_mm(model.fc, cur, model.fc_s);
     cb(cur, "fc_out", -1);
 
     cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
