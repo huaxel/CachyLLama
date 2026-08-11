@@ -122,6 +122,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     }
 
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
+    fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
 
@@ -276,7 +277,7 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
         cb(cur, "enc_aux_norm", -1);
     }
 
-    cur = build_lora_mm(model.fc, cur);
+    cur = build_lora_mm(model.fc, cur, model.fc_s);
     cb(cur, "fc_out", -1);
 
     cur = build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
@@ -587,9 +588,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(cur, "ffn_norm", il);
 
         cur = build_ffn(cur,
-                layer.ffn_up,   NULL, NULL,
-                layer.ffn_gate, NULL, NULL,
-                layer.ffn_down, NULL, NULL,
+                layer.ffn_up,   NULL, layer.ffn_up_s,
+                layer.ffn_gate, NULL, layer.ffn_gate_s,
+                layer.ffn_down, NULL, layer.ffn_down_s,
                 NULL,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
         cb(cur, "ffn_out", il);
@@ -606,15 +607,17 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     res->t_embd = cur;
 
     // lm_head from the target model (shared via ctx_other)
-    auto * output = model.output;
+    auto * output   = model.output;
+    auto * output_s = model.output_s;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
-        output = model_other->output;
+        output   = model_other->output;
+        output_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(output, cur, model.output_s);
+    cur = build_lora_mm(output, cur, output_s);
 
     // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
     if (model.d2t) {
@@ -790,15 +793,17 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
 
     // lm_head from the target model (shared via ctx_other)
-    auto * output = model.output;
+    auto * output   = model.output;
+    auto * output_s = model.output_s;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DSpark decoder requires the target model's output projection");
-        output = model_other->output;
+        output   = model_other->output;
+        output_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(output, cur);
+    cur = build_lora_mm(output, cur, output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
