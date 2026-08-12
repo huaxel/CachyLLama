@@ -8009,6 +8009,27 @@ bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_f
     return supported;
 }
 
+// Single source of truth for native FA K/V types. Anything outside this list is only correct
+// through the dequant-once scratch path, so supports_op and the dispatch-time dequant gate
+// must agree on when that path runs. iq4_nl is native since upstream 8161641.
+static bool ggml_vk_fa_kv_native(ggml_type t, bool coopmat2) {
+    GGML_UNUSED(coopmat2);
+    switch (t) {
+    case GGML_TYPE_F32:
+    case GGML_TYPE_F16:
+    case GGML_TYPE_BF16:
+    case GGML_TYPE_Q4_0:
+    case GGML_TYPE_Q4_1:
+    case GGML_TYPE_Q5_0:
+    case GGML_TYPE_Q5_1:
+    case GGML_TYPE_Q8_0:
+    case GGML_TYPE_IQ4_NL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
     GGML_UNUSED(v_type);
     // Needs to be kept up to date on shader changes
