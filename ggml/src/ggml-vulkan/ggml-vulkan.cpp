@@ -3653,6 +3653,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
 
+    // Grouped-GEMM redesign, Stage 1: row-list prepass. Builds a token -> {expert_slot, token_row}
+    // list that the per-row mmid pipeline drains. On by default; use_row_lists=0 in the push
+    // constants restores the old 2D row_id path (controlled by the gate in op_matmul_id).
+    ggml_vk_create_pipeline(device, device->pipeline_mmid_row_lists, "mmid_row_lists", mmid_row_lists_len, mmid_row_lists_data, "main", 2, sizeof(vk_op_mmid_row_lists_push_constants), {1, 1, 1}, {}, 1, true);
+
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
 
@@ -6073,13 +6078,15 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        bool hoist_row_ids) {
+        uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
+        bool hoist_row_ids, uint32_t padded_n, uint32_t use_row_lists) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, n_as, uint32_t(hoist_row_ids) };
+    const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
+                                              nei0, nei1, nbi1, ne11, n_as, uint32_t(hoist_row_ids), padded_n, use_row_lists };
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
 }
 
@@ -7552,8 +7559,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
 
-    const size_t expert_data_size = sizeof(uint32_t) *
-        (hoist_row_ids ? hoisted_row_id_words : n_as);
+    // Precompute per-expert row lists so each matmul workgroup reads its rows
+    // directly instead of re-scanning the whole ids tensor. Stored in the same
+    // buffer after the counts: [counts n_as][offsets n_as+1][cursors n_as][entries].
+    // The coopmat2 shaders only read the counts and don't use the lists.
+    // GGML_VK_MMID_ROWLISTS=0 disables it (same-binary A/B).
+    static const char * mmid_row_lists_env = getenv("GGML_VK_MMID_ROWLISTS");
+    const bool use_row_lists = !(mmid_row_lists_env && atoi(mmid_row_lists_env) == 0) && !ctx->device->coopmat2;
+
+    // The expert buffer must fit the hoisted row ids and/or the row lists.
+    size_t expert_words = hoist_row_ids ? hoisted_row_id_words : n_as;
+    const size_t row_list_words = (size_t) 3 * n_as + 1 + (size_t) nei0 * (size_t) nei1;
+    if (use_row_lists && row_list_words > expert_words) {
+        expert_words = row_list_words;
+    }
+    const size_t expert_data_size = sizeof(uint32_t) * expert_words;
 
     {
         if (
@@ -7586,6 +7606,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
         ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+        if (use_row_lists) {
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_mmid_row_lists, 1);
+        }
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
@@ -7706,6 +7729,19 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     ggml_vk_sync_buffers(ctx, subctx);
 
+    if (use_row_lists) {
+        // Prefix-sum the expert counts and scatter (ii0, ii1) into per-expert row lists
+        const std::vector<uint32_t> pc = { (uint32_t)nei0,
+                                           (uint32_t)nei1,
+                                           (uint32_t)(nbi0 / ggml_type_size(ids->type)),
+                                           (uint32_t)(nbi1 / ggml_type_size(ids->type)),
+                                           (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
+                                           (uint32_t)n_as };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mmid_row_lists,
+            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { 1, 1, 1});
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
     const uint64_t x_range = qx_needs_dequant ? x_sz : ggml_nbytes(src0);
     const uint64_t y_range = (qy_needs_dequant || quantize_y) ? y_sz : ggml_nbytes(src1);
 
@@ -7721,6 +7757,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
     }
 
+    // N padded for workgroup alignment when Y is dequantized on the fly (matches the
+    // dense path); the concat-transpose/row-lists push constants carry it as padded_N.
+    const uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
+
     // compute
     ggml_vk_matmul_id(
         ctx, subctx, pipeline,
@@ -7728,7 +7768,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         { d_D, d_buf_offset, d_sz }, { d_ids, ids_buf_offset, ids_sz }, expert_count_buf,
         ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
-        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, hoist_row_ids
+        n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, hoist_row_ids, padded_n,
+        use_row_lists ? 1u : 0u
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
