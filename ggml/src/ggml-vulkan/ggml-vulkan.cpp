@@ -201,6 +201,20 @@ void ggml_vk_print_device_fault_info(const vk_device& device) {
                 (unsigned long long)info.vendorFaultData);
     }
 }
+// Total memory traffic of a node (dst + srcs). Used to bound command buffer
+// execution time for bandwidth-bound ops with no flops estimate (large copies,
+// set_rows, mask fills at long context) - packing too many of them into one
+// submission can exceed the driver timeout.
+static uint64_t ggml_vk_get_node_bytes(const ggml_tensor * node) {
+    uint64_t bytes = ggml_nbytes(node);
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node->src[i]) {
+            bytes += ggml_nbytes(node->src[i]);
+        }
+    }
+    return bytes;
+}
+
 uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         const uint64_t m     = node->ne[0];
@@ -4265,6 +4279,15 @@ vk_device ggml_vk_get_device(size_t idx) {
         if (env_val != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(env_val);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
+        }
+
+        // Also submit once a batch has accumulated enough memory traffic, so that
+        // bandwidth-bound nodes with no flops estimate cannot grow a command buffer
+        // past the driver timeout. 0 disables the limit.
+        device->max_bytes_per_submit = 8ull * 1024 * 1024 * 1024;
+        const char* GGML_VK_MAX_MB_PER_SUBMIT = getenv("GGML_VK_MAX_MB_PER_SUBMIT");
+        if (GGML_VK_MAX_MB_PER_SUBMIT != nullptr) {
+            device->max_bytes_per_submit = std::stoull(GGML_VK_MAX_MB_PER_SUBMIT) * 1024 * 1024;
         }
 
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
@@ -14244,6 +14267,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint32_t submitted_nodes = 0;
     uint32_t submit_count = 0;
     uint64_t batch_flops = 0;
+    uint64_t batch_bytes = 0;
     uint64_t total_flops = 0;
     uint64_t flops_cap = 200'000'000'000ULL;
 
@@ -14281,6 +14305,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         first_node_in_batch = true;
         submitted_nodes = 0;
         batch_flops = 0;
+        batch_bytes = 0;
         if (submit_count < 3) {
             flops_per_submit *= 2;
         }
@@ -14308,6 +14333,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
 
             batch_flops += node_flops;
+            batch_bytes += ggml_vk_get_node_bytes(cgraph->nodes[i]);
         }
 
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
@@ -14571,6 +14597,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
+                      (ctx->device->max_bytes_per_submit != 0 && batch_bytes >= ctx->device->max_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
