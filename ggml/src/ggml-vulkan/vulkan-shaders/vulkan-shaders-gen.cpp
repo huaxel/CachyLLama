@@ -1123,6 +1123,7 @@ void process_shaders() {
 
     string_to_spv("count_experts", "count_experts.comp", merge_maps(base_dict, {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}}));
     string_to_spv("count_experts_subgroup", "count_experts.comp", merge_maps(base_dict, {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}, {"USE_SUBGROUPS", "1"}}));
+    string_to_spv("mmid_row_lists", "mmid_row_lists.comp", {});
 
     for (std::string dim_str : {"", "_3d"}) {
         for (bool bda : {false, true}) {

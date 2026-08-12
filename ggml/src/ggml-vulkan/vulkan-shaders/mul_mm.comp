@@ -147,6 +147,8 @@ layout (push_constant) uniform parameter
     uint ne11;
     uint n_experts;
     uint hoist_row_ids;
+    uint padded_N;
+    uint use_row_lists;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -285,8 +287,11 @@ void main() {
     const uint loadstride_b = gl_WorkGroupSize.x * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK;
 
 #ifdef MUL_MAT_ID
-    if (p.hoist_row_ids != 0) {
+    if (p.use_row_lists != 0) {
+        load_row_ids_from_lists(expert_idx, ic);
+    } else if (p.hoist_row_ids != 0) {
         load_row_ids_hoisted(expert_idx, ic);
+    } else {
     } else {
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
         if (bitCount(p.nei0) == 1) {
