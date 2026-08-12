@@ -217,6 +217,12 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // True when the container actually holds image/audio chunks (i.e. has
+    // rendered slide content for a multimodal model). Distinct from has_mtmd,
+    // which is overloaded to also mean "model is multimodal" - this one
+    // strictly reflects slot content. See issue #11.
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void clear() {
         // also reset the has_mtmd flag so a cleared container is recognised as
         // a plain text container. Without this, a slot whose prompt was reset
