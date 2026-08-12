@@ -829,7 +829,8 @@ void process_shaders() {
             string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
         }
         // Fused dequant+transpose variant for FA quant-KV (per-head-contiguous f16 scratch).
-        if (tname == "q8_0") {
+        // All four are bit-exact equal to the native FA f16 path once dequant-once is engaged.
+        if (tname == "q8_0" || tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1") {
             string_to_spv("dequant_" + tname + "_transpose", "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"DEQUANT_TRANSPOSE", "1"}}));
         }
         // Strided-copy counterpart for f16 KV (contiguize the head-interleaved cache layout).
