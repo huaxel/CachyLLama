@@ -1117,6 +1117,13 @@ void process_shaders() {
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
+    // C2 (Gaetan Puleo): coopmat variants of the lightning indexer (prefill + decode) and
+    // the top-k-aware sparse FA shader. Wired but not yet dispatched in ggml-vulkan.cpp -
+    // the C++ dispatch is the next step and requires the ggml_flash_attn_ext_add_top_k
+    // API change + DSV4 model integration to actually run.
+    string_to_spv("lightning_indexer_cm_f16", "lightning_indexer_cm.comp", {});
+    string_to_spv("lightning_indexer_decode_cm_f16", "lightning_indexer_decode_cm.comp", {});
+    string_to_spv("flash_attn_top_k_f16", "flash_attn_top_k.comp", {});
     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
