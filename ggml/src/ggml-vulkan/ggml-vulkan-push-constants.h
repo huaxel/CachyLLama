@@ -66,6 +66,7 @@ struct vk_mat_mat_id_push_constants {
     uint32_t hoist_row_ids;
     uint32_t padded_N;
     uint32_t use_row_lists;
+    uint32_t fusion_flags;
 };
 
 struct vk_mat_vec_id_push_constants {
