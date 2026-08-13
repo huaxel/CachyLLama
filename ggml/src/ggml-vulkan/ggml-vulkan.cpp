@@ -3682,6 +3682,77 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,       "dsv4_hc_post_f32",       dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 1 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_nocomb_f32,"dsv4_hc_post_nocomb_f32",dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256, 0 }, 1);
 
+    // Coopmat prefill + decode variants of the lightning indexer. Both shaders
+    // hardcode HEAD_SIZE=128, N_HEAD=64 and assume K is F16, so the dispatch in
+    // ggml_vk_lightning_indexer() picks the scalar f32 path when those don't
+    // match. The cm shader uses GL_KHR_cooperative_matrix (subgroup-scoped
+    // 16x16x16 f16 fragments); on RDNA3 wave64 each warp does a 16x16 GEMM and
+    // accumulates over N_HEAD=64 heads. We pin the subgroup size to whatever
+    // the device reports because the shader's SUBGROUP_SIZE spec constant also
+    // drives local_size_x via local_size_x_id=0 - both have to match the
+    // hardware subgroup or coopmat's WMMA layout is wrong. Coopmat1 16x16x16
+    // f16-acc + subgroup_size_control + (32 or 64) subgroup are all required;
+    // on devices that have coopmat2 but no usable 16x16x16 cm1 (very rare) we
+    // fall back to the scalar path.
+    // CachyLLama: the cm shaders (lightning_indexer_cm.comp prefill and
+    // _decode_cm.comp decode) hardcode TILE=16 and assume the workgroup's
+    // first TILE lanes do the per-kv accumulation/dst-store while lanes
+    // >=TILE sit idle. The shader's K/Q load loops use
+    // `for (idx = tid; idx < TILE*VEC_PER_HEAD; idx += SUBGROUP_SIZE)` to
+    // cooperatively fill shared memory across the wave, which works with
+    // any SUBGROUP_SIZE (32 or 64) as long as one full wave covers the
+    // 16 KV x 32 d4 = 512 vec4 layout. wg_denoms {16,16,1}/{16,1,1} feeds
+    // the dispatch grid math; the actual workgroup size is what the shader
+    // compiles to (local_size_x_id=0 -> device->subgroup_size). Lanes 16..63
+    // being idle in the dst-store phase means we run with 4x thread
+    // over-subscription on RDNA3 (wave64), but that's correct - lanes
+    // 16..63 of the wave simply skip the active-kv branch.
+    if (device->coopmat_support && device->coopmat_support_16x16x16_f16acc &&
+        device->subgroup_size_control &&
+        (device->subgroup_size == 32 || device->subgroup_size == 64)) {
+        // Use device's full subgroup size (32 or 64) so the i=0..3 outer loop
+        // in the prefill shader's accumulation phase covers 4*SUBGROUP_SIZE
+        // (key, token_local) entries per workgroup, which is 256 for the
+        // 16x16 tile. A 16-thread subgroup would only cover 64 (insufficient);
+        // a 32-thread subgroup covers 128 (still insufficient); only 64-thread
+        // (or larger) covers the full tile. The decode_cm shader has a known
+        // race with workgroup=64 (lanes 16..63 over-write dst across workgroups)
+        // and is currently disabled in cm_decode_ok.
+        // Prefill uses the device's native subgroup size (32 or 64). The
+        // i=0..3 outer loop in the prefill shader's accumulation phase covers
+        // 4*SUBGROUP_SIZE (key, token_local) entries per workgroup = 256 for
+        // the 16x16 tile. A 32-thread subgroup covers 128 (insufficient for
+        // the full tile); only 64-thread (or larger) covers it.
+        const uint32_t li_cm_prefill_sg = device->subgroup_size;
+        // Decode forces subgroup_size=32 via required_subgroup_size, which
+        // sets BOTH local_size_x (via local_size_x_id=0) and the SUBGROUP_SIZE
+        // spec constant to 32. With 32 threads, the `if (tid < TILE=16)` gate
+        // in the dst-store leaves exactly 16 idle lanes (no race). The K/Q
+        // load loops still cover the full 16x32 vec4 layout because they
+        // step by SUBGROUP_SIZE=32 (16 iterations x 32 lanes = 512 entries).
+        // On a 32-thread-only device (e.g. Phoenix) this is a no-op.
+        const uint32_t li_cm_decode_sg =
+            (device->subgroup_size == 64) ? 32u : device->subgroup_size;
+        // Prefill: wg_denoms {16,16,1} means grid = (n_kv/16, n_batch/16,
+        // n_stream). The shader covers one (kv_in_tile, batch_in_tile)
+        // block per workgroup via the i=0..3 outer loop in the prefill
+        // shader's accumulation/dst-store (4 iterations x SUBGROUP_SIZE
+        // lanes = 4*64 = 256 (key,token_local) pairs = 16x16 tile).
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_f16,
+            "lightning_indexer_cm_f16", lightning_indexer_cm_f16_len, lightning_indexer_cm_f16_data,
+            "main", 5, sizeof(vk_op_lightning_indexer_cm_push_constants),
+            { 16, 16, 1 }, { li_cm_prefill_sg }, 1, true, true, li_cm_prefill_sg);
+        // Decode: wg_denoms {16,1,1}, grid = (n_kv/16, n_batch, n_stream).
+        // required_subgroup_size=li_cm_decode_sg (32 on wave64, native on
+        // wave32) prevents the dst-store race: only lanes 0..TILE-1 are
+        // active, the rest are idle. require_full_subgroups=true ensures
+        // the subgroup is fully populated.
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_decode_cm_f16,
+            "lightning_indexer_decode_cm_f16", lightning_indexer_decode_cm_f16_len, lightning_indexer_decode_cm_f16_data,
+            "main", 5, sizeof(vk_op_lightning_indexer_cm_push_constants),
+            { 16, 1, 1 }, { li_cm_decode_sg }, 1, true, true, li_cm_decode_sg);
+    }
+
     // Grouped-GEMM redesign, Stage 1: row-list prepass. Builds a token -> {expert_slot, token_row}
     // list that the per-row mmid pipeline drains. On by default; use_row_lists=0 in the push
     // constants restores the old 2D row_id path (controlled by the gate in op_matmul_id).
@@ -4351,14 +4422,16 @@ vk_device ggml_vk_get_device(size_t idx) {
         // APU/iGPU workaround: large compute batches can exceed the kernel's 2s
         // amdgpu.lockup_timeout and fragment the SA suballocator, surfacing as
         // "radv/amdgpu: Not enough memory for command submission" followed by
-        // vk::Queue::submit: ErrorDeviceLost. UMA devices (RDNA3 Phoenix, etc.)
-        // default to 8 nodes per submit so each batch finishes well under 2s.
-        // CachyLLama RDNA3 (Phoenix1/Phoenix, gfx1103, e.g. 7840U) measurement on
-        // Qwen3.6-35B-A3B Q4_K_XL showed nps=100 completes without lockup and gives
-        // a reproducible +4.5% on tg64 over nps=8; nps=64 gets ~93% of that with
-        // less lockup risk and is what llama-run.sh exports on gfx1103. See
-        // RDNA3_NOTES.md. Users can override via GGML_VK_NODES_PER_SUBMIT.
-        device->max_nodes_per_submit = device->uma ? 8 : 100;
+        // vk::Queue::submit: ErrorDeviceLost. The conservative default on UMA
+        // was 8 nodes per submit; raising it gives a reproducible +4.5% on tg64
+        // (CachyLLama RDNA3, Phoenix1/Phoenix, gfx1103, e.g. 7840U, Qwen3.6-35B
+        // Q4_K_XL: nps=100 vs nps=8). Discrete GPUs handle more work per submit
+        // safely; 100 was the prior default there. A universal 64 hits the
+        // safe middle ground: ~93% of the nps=100 win on 7840U, well under the
+        // amdgpu timeout on any UMA device, and removes the UMA/discrete
+        // special case so the same default works on Strix Halo (gfx1151) too.
+        // See RDNA3_NOTES.md. Users can override via GGML_VK_NODES_PER_SUBMIT.
+        device->max_nodes_per_submit = 64;
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
         const char* GGML_VK_NODES_PER_SUBMIT    = getenv("GGML_VK_NODES_PER_SUBMIT");
         const char * env_val = GGML_VK_NODES_PER_SUBMIT ? GGML_VK_NODES_PER_SUBMIT : GGML_VK_MAX_NODES_PER_SUBMIT;
@@ -16058,7 +16131,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->op == GGML_OP_DSV4_HC_COMB) {
                     return device->pipeline_dsv4_hc_comb_f32 != nullptr;
                 }
-                return true;
+                // pre/post launch one workgroup row per token
+                const uint32_t n_tokens = (uint32_t)(op->op == GGML_OP_DSV4_HC_PRE ? op->src[0]->ne[2] : op->src[0]->ne[1]);
+                return n_tokens <= device->properties.limits.maxComputeWorkGroupCount[1];
             }
         case GGML_OP_SOLVE_TRI:
             {
