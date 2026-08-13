@@ -1344,7 +1344,8 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     // configurations the rule rejects. Diagnostic only.
     static const int fa_wave32 = [] {
         const char * e = getenv("GGML_VK_FA_WAVE32");
-        return e ? atoi(e) : 0;
+        return e ? atoi(e) : 1;  // default ON: pin a 32-wide subgroup on RDNA where
+                                  // narrowing is free. Override with =0 to disable.
     }();
     if (fa_wave32 != 0 &&
         device->subgroup_size_control &&
@@ -6094,15 +6095,15 @@ static void ggml_vk_matmul_id(
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        bool hoist_row_ids, uint32_t padded_n, uint32_t use_row_lists) {
+        bool hoist_row_ids, uint32_t padded_n, uint32_t use_row_lists, const vk_subbuffer & fused_scale, uint32_t fusion_flags) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, n_as, uint32_t(hoist_row_ids), padded_n, use_row_lists };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf }, pc, { m, nei1, n_as });
+                                              nei0, nei1, nbi1, ne11, n_as, uint32_t(hoist_row_ids), padded_n, use_row_lists, fusion_flags };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, { m, nei1, n_as });
 }
 
 bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -7388,7 +7389,7 @@ void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const st
     }
 }
 
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -7428,7 +7429,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                 hoisted_row_id_words * sizeof(uint32_t) <=
                                     ctx->device->properties.limits.maxStorageBufferRange;
 
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    // When the following MUL is fused in, write the scaled result straight to its destination.
+    const ggml_tensor * out_dst = fused_dst ? fused_dst : dst;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)out_dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
     ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
@@ -7519,6 +7522,19 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && nei1 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
+
+    // PROBE (GGML_VK_MMID_PROBE=1): which mmid tile actually runs, and with how many threads.
+    static const char * mmid_probe_env = getenv("GGML_VK_MMID_PROBE");
+    if (mmid_probe_env && atoi(mmid_probe_env) != 0) {
+        static std::set<std::string> seen;
+        uint32_t n_for_tile = (uint32_t)nei1;
+        std::string key = pipeline->name + ":" + std::to_string(n_for_tile);
+        if (seen.insert(key).second) {
+            fprintf(stderr, "ggml_vulkan: mmid pipeline=%s n_for_tile=%u m=%u wg=(%u,%u,%u)\n",
+                    pipeline->name.c_str(), n_for_tile, (uint32_t)ne01,
+                    pipeline->wg_denoms[0], pipeline->wg_denoms[1], pipeline->wg_denoms[2]);
+        }
+    }
 
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
@@ -7626,7 +7642,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    const uint64_t d_buf_offset = vk_tensor_offset(out_dst) + out_dst->view_offs;
     GGML_ASSERT(d_D != nullptr);
     vk_buffer d_X;
     uint64_t x_buf_offset = 0;
@@ -7783,7 +7799,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ne01, ne21, ne10, ne10, stride_b_y, ne01,
         stride_batch_x, stride_batch_y, ne20*ne21,
         n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, hoist_row_ids, padded_n,
-        use_row_lists ? 1u : 0u
+        use_row_lists ? 1u : 0u,
+        fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
+        fused_scale ? 1u : 0u
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -8048,7 +8066,16 @@ void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
-        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst);
+        // Fused scale epilogue: the MUL's other operand is applied as the matmul writes out,
+        // and the result goes straight to the MUL's destination.
+        const ggml_tensor * fused_scale = nullptr;
+        ggml_tensor * fused_dst = nullptr;
+        if (ctx->num_additional_fused_ops == 1) {
+            ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+            fused_scale = (mul->src[0] == dst) ? mul->src[1] : mul->src[0];
+            fused_dst   = mul;
+        }
+        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, fused_scale, fused_dst);
     }
 }
 
@@ -12644,6 +12671,22 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
             break;
         }
 
+        // Fused silu(x)*y: run it as a swiglu split, writing straight to the MUL's destination.
+        if (ctx->num_additional_fused_ops == 1) {
+            ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+            ggml_tensor * other = (mul->src[0] == node) ? mul->src[1] : mul->src[0];
+
+            ggml_tensor fused = *mul;
+            fused.op = GGML_OP_GLU;
+            memset(fused.op_params, 0, sizeof(fused.op_params));
+            ggml_set_op_params_i32(&fused, 0, (int32_t) GGML_GLU_OP_SWIGLU);
+            fused.src[0] = node->src[0];
+            fused.src[1] = other;
+
+            ggml_vk_glu(ctx, compute_ctx, fused.src[0], fused.src[1], &fused);
+            break;
+        }
+
         switch (ggml_get_unary_op(node)) {
         case GGML_UNARY_OP_ELU:
         case GGML_UNARY_OP_EXP:
@@ -13754,15 +13797,61 @@ bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgr
         }
     }
 
+    // EXPERIMENT (GGML_VK_FUSE_UNARY_MUL=1): silu(x)*y is emitted as two nodes by the delta-net
+    // path, so the silu result makes a full round trip through memory. That is the same shape
+    // swiglu-split already computes in one pass, so route the pair to the existing GLU pipeline.
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
+        static const char * env = getenv("GGML_VK_FUSE_UNARY_MUL");
+        if (!(env && atoi(env) != 0)) {
+            return false;
+        }
+        const ggml_tensor * unary = cgraph->nodes[node_idx];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+
+        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU) {
+            return false;
+        }
+        if (mul->src[0] != unary && mul->src[1] != unary) {
+            return false;
+        }
+        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+        // The GLU split shader walks both inputs and the output with the same element count.
+        if (unary->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_are_same_shape(unary, other) || !ggml_are_same_shape(unary, mul)) {
+            return false;
+        }
+        if (!ggml_is_contiguous(unary->src[0]) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mul)) {
+            return false;
+        }
+        return true;
+    }
+
     auto const &mmid_mul_ok = [&](const ggml_tensor *mmid, const ggml_tensor *mul) {
         const ggml_tensor *scale = mul->src[1];
 
         if (mmid != mul->src[0]) {
             return false;
         }
-        // mat-vec only
+        // EXPERIMENT (GGML_VK_MMID_SCALE_EPILOGUE=1): the tile shader can apply the scale as it
+        // writes out, which removes a full write+read of the matmul result at prefill. The
+        // coopmat2 shader has the binding but not the epilogue, so it stays on the old path.
         if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
-            return false;
+            static const char * env = getenv("GGML_VK_MMID_SCALE_EPILOGUE");
+            if (!(env && atoi(env) != 0) || ctx->device->coopmat2) {
+                return false;
+            }
+            // Shader indexes the scale as [token * nei0 + expert_slot].
+            if (scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale)) {
+                return false;
+            }
+            if (get_misalign_bytes(ctx, scale) != 0) {
+                return false;
+            }
+            return scale->ne[0] == 1 &&
+                   scale->ne[1] == mmid->ne[1] && scale->ne[2] == mmid->ne[2] && scale->ne[3] == mmid->ne[3] &&
+                   ggml_are_same_shape(mul, mmid);
         }
         // shaders assume the types match
         if (mmid->type != scale->type) {
@@ -14535,6 +14624,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_can_fuse_subgraph(cgraph, i, rms_norm_mul_rope_view_set_rows_pattern, { i + 4 }) &&
+            } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "SILU_MUL";
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&
                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i + 2)) {
