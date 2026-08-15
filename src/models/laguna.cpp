@@ -264,7 +264,8 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "attn_o_proj", il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        // Crop to output-token rows only when nextn embeddings are masked. When unmasked (the DFlash target path), keep all rows so t_h_nextn matches the full embd_nextn buffer size. The inp_out_ids crop for logits is deferred below. (cf. qwen35.cpp)
+        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -323,7 +324,21 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
     }
 
+    // expose the post-final-layer hidden state (before the final output
+    // norm) as t_h_nextn, so DFlash/EAGLE3 draft models can read it via
+    // llama_get_embeddings_nextn().  target_layer_ids that include
+    // n_layer_tgt expect this buffer; without it the embd_nextn output
+    // is never populated and the draft encoder receives stale data.
+    //
+    // t_h_nextn keeps all token rows (matching the unmasked embd_nextn
+    // buffer size).  The inp_out_ids crop is deferred to the logits path
+    // below so t_h_nextn is never smaller than ubatch.n_tokens.
+    res->t_h_nextn = inpL;
+
     cur = inpL;
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
