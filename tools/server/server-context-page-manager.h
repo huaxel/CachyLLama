@@ -77,6 +77,7 @@ public:
     );
 
     // Load a checkpoint back to slot memory
+    // dest_seq_id: sequence ID to restore KV cells under (defaults to UINT32_MAX, falls back to meta->slot_id)
     bool load_checkpoint(
         uint32_t slot_id,
         uint32_t turn_id,
@@ -85,10 +86,12 @@ public:
         int32_t& out_pos_min,
         int32_t& out_pos_max,
         uint64_t& out_n_tokens,
-        std::vector<uint8_t>* out_spec_data = nullptr
+        std::vector<uint8_t>* out_spec_data = nullptr,
+        uint32_t dest_seq_id = UINT32_MAX
     );
 
     // Load a checkpoint by its SSD cache ID (for cross-slot restore)
+    // dest_seq_id: sequence ID to restore KV cells under (defaults to UINT32_MAX, falls back to meta->slot_id)
     bool load_checkpoint_by_id(
         uint64_t checkpoint_id,
         struct llama_context* ctx,
@@ -96,7 +99,8 @@ public:
         int32_t& out_pos_min,
         int32_t& out_pos_max,
         uint64_t& out_n_tokens,
-        std::vector<uint8_t>* out_spec_data = nullptr
+        std::vector<uint8_t>* out_spec_data = nullptr,
+        uint32_t dest_seq_id = UINT32_MAX
     );
 
     // Prefetch checkpoints for a slot before processing

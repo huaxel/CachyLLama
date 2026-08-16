@@ -264,7 +264,8 @@ bool server_context_page_manager::load_checkpoint(
     int32_t& out_pos_min,
     int32_t& out_pos_max,
     uint64_t& out_n_tokens,
-    std::vector<uint8_t>* out_spec_data
+    std::vector<uint8_t>* out_spec_data,
+    uint32_t dest_seq_id
 ) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
@@ -286,7 +287,10 @@ bool server_context_page_manager::load_checkpoint(
     if (!sc) return false;
 
     // Load from SSD cache, which will promote to hot tier
-    bool ok = sc->load(it->second.checkpoint_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data);
+    // Pass dest_seq_id so KV cells are restored under the correct seq_id
+    // (important for cross-slot restores where current slot differs from
+    // the slot that originally stored the checkpoint).
+    bool ok = sc->load(it->second.checkpoint_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data, dest_seq_id);
 
     if (ok) {
         it->second.last_access = get_timestamp_ms();
@@ -306,7 +310,8 @@ bool server_context_page_manager::load_checkpoint_by_id(
     int32_t& out_pos_min,
     int32_t& out_pos_max,
     uint64_t& out_n_tokens,
-    std::vector<uint8_t>* out_spec_data
+    std::vector<uint8_t>* out_spec_data,
+    uint32_t dest_seq_id
 ) {
     if (checkpoint_id == 0) return false;
 
@@ -322,7 +327,8 @@ bool server_context_page_manager::load_checkpoint_by_id(
     }
     if (!sc) return false;
 
-    bool ok = sc->load(checkpoint_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data);
+    // Pass dest_seq_id for cross-slot restore safety
+    bool ok = sc->load(checkpoint_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data, dest_seq_id);
 
     if (ok) {
         cache_hits_++;
