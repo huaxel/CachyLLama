@@ -332,6 +332,160 @@ grep -rn "pattern" src/ common/ include/
 
 ---
 
+## Context checkpoint system (`tools/server/server-context.cpp`)
+
+The server maintains a per-slot ring buffer of in-memory KV cache snapshots
+("context checkpoints") used to skip prompt reprocessing on cached turns
+(LCP / f_keep optimization). Four interlocking pieces -- change one, re-verify
+the others.
+
+### 1. Two producer paths feeding one `std::list<common_prompt_checkpoint>`
+
+- **`create_checkpoint(slot, n_tokens_cur, pos_min, pos_max)`** -- mid-prompt
+  snapshots fired during prefill when a batch starts a user message (or
+  `--checkpoint-near-end` is set and we're near the prompt end).  Uses the
+  live KV cache's `pos_min` / `pos_max` from `llama_memory_seq_pos_*`,
+  skipping if checkpoints are too close (`params_base.checkpoint_min_step`,
+  default 32768).
+- **`deferred_create_final_checkpoint(slot)`** -- after the first generation
+  token lands, captures a full prompt snapshot at `pos_min=0`,
+  `pos_max = prompt_n_tokens - 1`.  Runs asynchronously so the SSD write
+  doesn't block decode.
+
+Both add with `emplace_back`, so list position == insertion order.
+
+### 2. Insertion-order ring buffer eviction (BOTH paths)
+
+When the list reaches `params_base.n_ctx_checkpoints` (typically 8-32), the
+ring buffer pops the FRONT (oldest) and appends the new entry at the back:
+
+```cpp
+if (size >= n_ctx_checkpoints) {
+    auto & victim = slot.prompt.checkpoints.front();
+    SLT_TRC(slot, "recycling oldest ... (pos_min=%d, pos_max=%d, ...)");
+    slot.prompt.checkpoints.pop_front();
+}
+slot.prompt.checkpoints.emplace_back();
+```
+
+Why insertion-order, not "highest pos_min": deferred finals all carry
+`pos_min == 0`, so the old strict-greater-than comparator always picked
+`begin()` and recycled slot 1 every time -- a single-slot FIFO with 15 dead
+entries.  Insertion order breaks the tie and gives a true round-robin across
+conversation snapshots.  The acceptance predicate filters by `pos_min` /
+`pos_max` regardless of list position, so cycling doesn't affect matching.
+
+Cold-start mid-prompts (created on a fresh slot where `pos_min_thold == 0`
+makes the first batch's `pos_min` equal 0 too) share the same `pos_min == 0`
+signature as deferred finals.  They're valid LCP snapshots either way -- they
+just consume one of the N ring buffer slots.
+
+### 3. SWA-skipped entries persist across turns
+
+In `get_available()` (`server-context.cpp` ~line 4314) there's an SWA
+invalidation block:
+
+```cpp
+for (auto it = slot.prompt.checkpoints.begin(); ...;) {
+    const auto & cur = *it;
+    const bool deferred_final_snapshot = (cur.pos_min == 0);
+    if (!deferred_final_snapshot && cur.pos_max > pos_next) {
+        // erase
+        it = slot.prompt.checkpoints.erase(it);
+    } else { ++it; }
+}
+```
+
+Deferred-final snapshots (`pos_min == 0`) are preserved across turns.  Without
+this guard, the SWA step would erase every prior deferred final and the ring
+buffer would never accumulate past 2 entries.
+
+Genuine SWA invalidation still happens inside the LCP acceptance predicate
+(`server-context.cpp` ~line 4198):
+
+```cpp
+if (n_swa > 0 && cur.pos_max > pos_next) return false;
+```
+
+That predicate is the right place to filter by SWA coverage; the
+`get_available()` guard exists only to keep the buffer populated, not to make
+SWA-correctness decisions.
+
+**Don't add a redundant erase here based on SWA coverage -- that path will
+self-conflict.**
+
+### 4. Memory budget (`_ckpt_memory_budget()`)
+
+The size-based eviction runs BEFORE count-based eviction in both
+`create_checkpoint()` and `deferred_create_final_checkpoint()`:
+
+```cpp
+size_t _ckpt_memory_budget() const {
+    const size_t default_limit = (size_t)2 * 1024 * 1024 * 1024;  // 2 GiB floor
+    if (params_base.n_ctx_checkpoints <= 0) return default_limit;
+    // 400 MiB per configured checkpoint = 200 MiB working set * 2 headroom.
+    const size_t per = (size_t)params_base.n_ctx_checkpoints * 400 * 1024 * 1024;
+    return std::max(default_limit, per);
+}
+```
+
+The budget scales with `n_ctx_checkpoints` so the auto-scaled count from
+llama-ai (`scripts/optimize.sh`, 8 base + 1 per 8K above 65K context, capped
+at 32) actually fires.  An earlier version coupled it to `cache_ram` (1%) and
+unconditionally capped checkpoints at 3-4 -- the auto-scaling was a no-op.
+
+Worst case at 32 checkpoints: 32 * 400 MiB = 12.8 GiB ceiling, capped at 2 GiB
+via the `default_limit` floor.  For the default 16 checkpoints at typical
+q8_0 KV (~50 MiB each ~= 800 MiB total), nothing changes.
+
+### 5. LCP acceptance predicate
+
+The walk in `get_available() / receive/decode-input` (`server-context.cpp`
+~line 4264):
+
+```cpp
+const auto it = std::find_if(
+    slot.prompt.checkpoints.rbegin(),
+    slot.prompt.checkpoints.rend(),
+    [&](const auto & cur) {
+        if (n_swa > 0 && cur.pos_max > pos_next) {
+            return false;  // SWA filter
+        }
+        return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+    });
+```
+
+Reverse iteration (newest first).  The first qualifying entry wins.  Both
+deferred finals (`pos_min=0`) and early-mid-prompts (`pos_min < pos_min_thold`)
+are accepted; mid-prompts whose `pos_min` falls past `pos_min_thold` but
+haven't been SWA-shifted are also accepted.
+
+### Auto-scaling (from `llama-ai/scripts/optimize.sh`)
+
+```bash
+base_ctx=65536 base_cp=8 scale_per=8192 max_cp=32
+if [[ $ctx -gt $base_ctx ]]; then
+    extra=$(( (ctx - base_ctx) / scale_per ))
+    SOLVER_CHECKPOINTS=$(( base_cp + extra ))
+fi
+[[ $SOLVER_CHECKPOINTS -gt $max_cp ]] && SOLVER_CHECKPOINTS=$max_cp
+```
+
+| Context | Checkpoints |
+| ------- | ----------- |
+| <= 65 K | 8           |
+| 98 K    | 12          |
+| 131 K   | 16          |
+| 196 K   | 24          |
+| 262 K   | 32 (capped) |
+
+Verified on Nimo (Strix Halo) with Laguna-S-2.1 Q5_K_XL at 131K context:
+ring buffer saturates at 16, then cycles oldest-first across turns 1..16,
+1..16, ... -- true round-robin.  f_keep climbs monotonically (0.488 ->
+0.949 across 20 turns), 18 ckpt-restored events after the first cold turn.
+
+---
+
 ## CachyLLama development conventions
 
 ### Upstream tracking
