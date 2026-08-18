@@ -434,9 +434,10 @@ llama-ai (`scripts/optimize.sh`, 8 base + 1 per 8K above 65K context, capped
 at 32) actually fires.  An earlier version coupled it to `cache_ram` (1%) and
 unconditionally capped checkpoints at 3-4 -- the auto-scaling was a no-op.
 
-Worst case at 32 checkpoints: 32 * 400 MiB = 12.8 GiB ceiling, capped at 2 GiB
-via the `default_limit` floor.  For the default 16 checkpoints at typical
-q8_0 KV (~50 MiB each ~= 800 MiB total), nothing changes.
+Worst case at 32 checkpoints: 32 * 400 MiB = 12.8 GiB (the `std::max`
+floors at 2 GiB so small checkpoint counts still get a 2 GiB working
+set).  For the default 16 checkpoints at typical q8_0 KV (~50 MiB each
+~= 800 MiB total), nothing changes.
 
 ### 5. LCP acceptance predicate
 
