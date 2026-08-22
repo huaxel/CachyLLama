@@ -59,7 +59,8 @@ public:
     uint64_t find_match(const llama_token* tokens, size_t tokens_size, uint32_t current_turn,
                         uint64_t max_n_tokens = UINT64_MAX,
                         int32_t n_past = -1,
-                        int32_t* out_lcp = nullptr);
+                        int32_t* out_lcp = nullptr,
+                        bool* out_partial = nullptr);
 
     // Find best checkpoint for a slot.
     uint64_t find_by_slot(uint32_t slot_id, uint64_t min_tokens, uint32_t current_turn);
