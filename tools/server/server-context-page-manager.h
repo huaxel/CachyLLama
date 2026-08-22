@@ -149,6 +149,7 @@ public:
         int32_t* out_lcp = nullptr,
         float* out_overlap = nullptr,
         bool* out_is_continuation = nullptr,
+        bool* out_partial = nullptr,
         const std::string& user_id = std::string()
     );
 

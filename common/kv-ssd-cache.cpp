@@ -853,13 +853,15 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
                            uint32_t current_turn,
                            uint64_t max_n_tokens,
                            int32_t n_past,
-                           int32_t* out_lcp)
+                           int32_t* out_lcp,
+                           bool* out_partial)
 {
     (void)current_turn;  // unused - was for cross-conversation matching
     (void)n_past;        // unused - was for tiered search
     if (!cache || !cache->initialized || !tokens || tokens_size == 0) return 0;
 
-    if (out_lcp) *out_lcp = 0;
+    if (out_lcp)     *out_lcp = 0;
+    if (out_partial) *out_partial = false;
 
     std::lock_guard<std::mutex> lock(cache->mutex);
 
@@ -869,10 +871,10 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
     int32_t best_lcp = 0;
     uint32_t best_turn = 0;
     uint64_t best_n_tokens = 0;
+    bool best_full = false;  // true = full hash+size match, false = partial LCP
 
     for (const auto& [id, ckpt] : cache->index) {
         if (cache->compat_hash != 0 && ckpt.compat_hash != cache->compat_hash) continue;
-        if (max_n_tokens > 0 && ckpt.n_tokens > max_n_tokens) continue; // skip checkpoints larger than task
 
         // Compute longest common prefix with stored token prefix
         const size_t cmp_count = std::min(tokens_size, ckpt.token_prefix.size());
@@ -881,19 +883,45 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
             if (tokens[i] == ckpt.token_prefix[i]) lcp++;
             else break;
         }
-
-        // The stored prefix only narrows the candidate set. A checkpoint is
-        // reusable only when the complete token range represented by its state
-        // matches the stored hash.
         if (lcp == 0) continue;
-        if (tokens_size < ckpt.n_tokens) continue;
-        if (ckpt.token_hash != kv_ssd_hash_tokens(tokens, ckpt.n_tokens)) continue;
 
-        // Prefer highest LCP first (most cache reuse). Break ties by
-        // most recent turn, then by more tokens within the same turn.
-        if (lcp > best_lcp ||
-            (lcp == best_lcp && ckpt.turn_created > best_turn) ||
-            (lcp == best_lcp && ckpt.turn_created == best_turn && ckpt.n_tokens > best_n_tokens)) {
+        // Determine match quality:
+        //   Full match: the entire stored token sequence matches the input
+        //     (hash check passes AND input is long enough). The entire
+        //     checkpoint state is valid.
+        //   Partial LCP match: prefix matches for >= KV_SSD_TOKEN_PREFIX_MAX
+        //     tokens but the full sequence hash differs (e.g., an agent trim
+        //     modified middle tokens, so the stored hash no longer matches).
+        //     The state is valid only up to the LCP; the caller caps n_past
+        //     to the LCP and strips post-LCP attention KV.
+        //     Skip the max_n_tokens filter for partial matches — we only use
+        //     lcp tokens, not ckpt.n_tokens.
+        const bool size_ok    = (tokens_size >= ckpt.n_tokens);
+        // Short-circuit: don't read past tokens array when too short.
+        const bool hash_match = size_ok &&
+            (ckpt.token_hash == kv_ssd_hash_tokens(tokens, ckpt.n_tokens));
+
+        if (hash_match && size_ok) {
+            // Full match: apply standard max_n_tokens filter.
+            if (max_n_tokens > 0 && ckpt.n_tokens > max_n_tokens) continue;
+        } else if (lcp >= (int32_t)KV_SSD_TOKEN_PREFIX_MAX) {
+            // Partial LCP match: accept, caller caps to LCP.
+            // max_n_tokens filter skipped — lcp <= tokens_size by construction.
+        } else {
+            continue;
+        }
+
+        // Prefer full matches over partial matches, then highest LCP,
+        // then most recent turn, then more tokens.
+        int score = (hash_match && size_ok) ? 2 : 1;
+        int best_score = best_full ? 2 : 1;
+
+        if (best_id == 0 ||
+            score > best_score ||
+            (score == best_score && lcp > best_lcp) ||
+            (score == best_score && lcp == best_lcp && ckpt.turn_created > best_turn) ||
+            (score == best_score && lcp == best_lcp && ckpt.turn_created == best_turn && ckpt.n_tokens > best_n_tokens)) {
+            best_full = (hash_match && size_ok);
             best_turn = ckpt.turn_created;
             best_n_tokens = ckpt.n_tokens;
             best_lcp = lcp;
@@ -905,11 +933,13 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
         auto it = cache->index.find(best_id);
         uint64_t ntok = it != cache->index.end() ? (uint64_t)it->second.n_tokens : 0;
         LOG_INF("SSD cache: match checkpoint %lu conv=%016" PRIx64
-                " turn=%u n_tokens=%lu lcp=%d\n",
+                " turn=%u n_tokens=%lu lcp=%d%s\n",
                 (unsigned long)best_id, cache->conv_hash,
-                best_turn, (unsigned long)ntok, best_lcp);
+                best_turn, (unsigned long)ntok, best_lcp,
+                best_full ? "" : " (partial LCP)");
     }
-    if (best_id != 0 && out_lcp) *out_lcp = best_lcp;
+    if (best_id != 0 && out_lcp)     *out_lcp = best_lcp;
+    if (best_id != 0 && out_partial) *out_partial = !best_full;
 
     return best_id;
 }

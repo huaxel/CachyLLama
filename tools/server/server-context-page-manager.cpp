@@ -485,6 +485,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
     int32_t* out_lcp,
     float* out_overlap,
     bool* out_is_continuation,
+    bool* out_partial,
     const std::string& user_id
 ) {
     if (!user_id.empty()) {
@@ -494,7 +495,8 @@ bool server_context_page_manager::find_and_load_checkpoint(
         if (!sc) return false;
 
         int32_t match_lcp = 0;
-        uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp);
+        bool match_partial = false;
+        uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp, &match_partial);
         if (ckpt_id == 0) { cache_misses_++; return false; }
 
         // Prefetch the checkpoint file from SSD while we prepare to load it.
@@ -514,6 +516,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
             // Case 2 still gates on ssd_lcp >= PREFIX_MAX, so this is a no-op
             // when the LCP is too small to trust beyond the stored prefix.
             if (out_overlap) *out_overlap = 1.0f;
+            if (out_partial) *out_partial = match_partial;
         } else {
             cache_misses_++;
         }
@@ -543,7 +546,8 @@ bool server_context_page_manager::find_and_load_checkpoint(
     if (!sc) return false;
 
     int32_t match_lcp = 0;
-    uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp);
+    bool match_partial = false;
+    uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp, &match_partial);
     if (ckpt_id == 0) {
         cache_misses_++;
         return false;
@@ -574,6 +578,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
         // Case 2 in server-context.cpp still requires ssd_lcp >= PREFIX_MAX,
         // so a short LCP safely falls through to the partial-coverage branch.
         if (out_overlap && !is_continuation) *out_overlap = 1.0f;
+        if (out_partial) *out_partial = match_partial;
     } else {
         cache_misses_++;
     }
