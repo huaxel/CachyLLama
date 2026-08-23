@@ -1809,8 +1809,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
+        // don't skip entries just because the LCP ratio is low — after an agent
+        // trim, even a 30-40% prefix match in a large cached prompt can still
+        // save significant prefill work. The f_sim_cur check in the selection
+        // logic below ensures the best match is always chosen.
+        if (f_keep_cur < 0.01f) {
             continue;
         }
 

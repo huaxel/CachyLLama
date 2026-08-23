@@ -1590,8 +1590,12 @@ private:
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
+                // if we are about to lose any portion of the existing context - save it in the prompt cache
+                // for cold-start recovery on a future turn. Previously this only fired
+                // when f_keep < 0.5f (more than 50% of the stored prompt discarded), which
+                // meant the prompt cache was never updated for moderate trims (e.g. 40%
+                // loss from an agent trim), leaving cold starts without a useful entry.
+                if (f_keep < 1.0f) {
                     update_cache = true;
                 }
             }
