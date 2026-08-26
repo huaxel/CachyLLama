@@ -1268,24 +1268,11 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
                     auto arg_open = p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param_name)) + ">\n");
 
-                    // Same constraint-bypass fix as deepseek_v3_2 (see comment there):
-                    // when the schema carries enum/const/pattern/etc., route through the
-                    // JSON-schema grammar so the constrained value list is enforced
-                    // instead of letting the model emit any raw string.
-                    bool is_constrained_string =
-                        schema_info.resolves_to_string(param_schema) &&
-                        (param_schema.contains("enum") ||
-                         param_schema.contains("const") ||
-                         param_schema.contains("pattern") ||
-                         param_schema.contains("format") ||
-                         param_schema.contains("minLength") ||
-                         param_schema.contains("maxLength"));
-
-                    auto arg_value = is_constrained_string ?
-                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close :
-                        schema_info.resolves_to_string(param_schema) ?
-                            arg_string :
-                            p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
+                    // Qwen emits scalar string arguments as raw text, including values
+                    // constrained by enum/const fields; only non-string values use JSON.
+                    auto arg_value = schema_info.resolves_to_string(param_schema) ?
+                        arg_string :
+                        p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", param_schema)) + arg_close;
 
                     auto arg_rule = p.rule(rule_name, p.tool_arg(arg_open + arg_value));
 
