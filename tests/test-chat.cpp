@@ -4499,7 +4499,8 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 "</think>"
                 "<tool_call>get_weather"
                 "<arg_key>city</arg_key><arg_value>Tokyo</arg_value>"
-                "</tool_call>\n";
+                "</tool_call>\n"
+                "unexpected trailing output";
 
             bool got_runtime_error = false;
             bool got_out_of_range = false;
