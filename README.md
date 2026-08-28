@@ -75,6 +75,30 @@ split. CachyLLama tracks recurrent state separately from attention cells, uses
 `llama_memory_seq_rm_attn_only` to clear attention cells without disturbing
 recurrent state. MLA support for DeepSeek2/DeepSeek3 is included.
 
+### Host-memory prompt cache (`--cache-ram`)
+
+An in-memory ring of serialized KV state blobs, designed for the
+**agentic-interleaving** workload: a single agent makes multiple divergent
+auxiliary calls (keyword extraction, summarization, sub-questions) before
+returning to the main thread. The cache holds prior prompts so the next
+auxiliary call can find a divergent-prefix match instead of reprocessing the
+full context from scratch.
+
+**Only useful with `--parallel > 1`.** With a single slot, the only slot in
+the system is the one being saved and immediately reloaded, so the cache can
+never hold state between requests — the just-saved entry is consumed by the
+load step in the same call, and the cache ends up empty. CachyLLama skips the
+save+load round-trip when `n_parallel <= 1` so the work doesn't happen at all
+(no VRAM↔RAM round-trip, no 1-second-per-turn stall). For multi-slot
+configurations the cache works as designed: idle slots accumulate divergent
+state that the LCP matcher uses to hot-swap into a fresh task.
+
+In single-slot deployments, the in-memory checkpoint ring
+(`slot.prompt.checkpoints`, the `deferred_create_final_checkpoint` system)
+already covers the same problem space at zero cost — it holds raw KV slices
+in VRAM, and the LCP match at slot selection restores them with a same-VRAM
+copy rather than a VRAM↔RAM round-trip.
+
 ### MoE expert management
 
 Three subsystems work together to run models larger than physical memory:
@@ -255,6 +279,14 @@ Generation holds steady at 36–38 t/s across all turns.
 |------|---------|-------------|
 | `--cache-ssd-system-prompts N` | 8 | Max global system prompt entries cached for reuse across conversations |
 | `--cache-ssd-system-max-days N` | 30 | Expire system prompt entries unused for N days |
+
+### Host-memory prompt cache
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cache-ram N` | 8192 | Host-memory prompt cache size in MiB. Only useful with `--parallel > 1`; with a single slot the save+load round-trip is a no-op (skipped automatically). Set to 0 to disable. `-1` for no limit. |
+| `--cache-idle-slots` | enabled | Save idle slots to the prompt cache on new task. Requires `--cache-ram > 0`. With `--kv-unified`, idle slots are also cleared to make room for new tasks. |
+| `--parallel N` (`-np`) | 1 | Number of server slots. Each slot holds its own KV cache; multiple slots let several conversations run concurrently without blocking each other. CachyLLama's parent launcher (`llama-run.sh`) defaults to 1; raise to 2+ to host multiple agent sessions. Per-slot KV memory cost is `n_ctx * layer_count * head_dim * 2 (K+V) * dtype_bytes`. |
 
 ### User isolation
 

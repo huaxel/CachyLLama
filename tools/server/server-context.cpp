@@ -1345,6 +1345,18 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            // The host-memory prompt cache is only useful when multiple
+            // slots are configured. With n_parallel == 1 there is exactly
+            // one slot, so the save+load round-trip in get_available_slot
+            // runs back-to-back on the same slot and the cache can never
+            // accumulate state. The guard in get_available_slot() skips
+            // the round-trip in that case (a no-op), but the memory is
+            // still reserved. Warn the user so the explicit setting is
+            // visible.
+            if (params_base.n_parallel <= 1) {
+                SRV_WRN("%s\n", "--cache-ram is a no-op with a single slot (the prompt cache cannot accumulate state when the only slot is also the one being saved+loaded). Use --parallel > 1 for cross-task prompt cache reuse, or pass --cache-ram 0 to silence this warning.");
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1630,6 +1642,22 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            // With a single slot (n_parallel <= 1), the host-memory prompt
+            // cache cannot accumulate state between requests: the only slot
+            // in the system is the one we just selected, and the save+load
+            // round-trip below is back-to-back in this same call, so the
+            // just-saved entry is immediately consumed by prompt_load() and
+            // the cache ends up empty. Each turn still pays the cost of
+            // copying 0.9-2.6 GiB of state out of VRAM and back in for no
+            // benefit. Skip the round-trip when there is no other slot for
+            // the cache to hold entries for. The in-memory checkpoint ring
+            // (slot.prompt.checkpoints) and the SSD page manager already
+            // cover the same use case for the common single-slot workloads.
+            if (update_cache && params_base.n_parallel <= 1) {
+                SRV_TRC("%s", "skipping prompt cache update (n_parallel <= 1, cache cannot hold state between back-to-back save+load on the same slot)\n");
+                update_cache = false;
+            }
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -2519,6 +2547,13 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
+                        // With n_parallel <= 1, the slot we just launched
+                        // a task on is now the only slot, and it is now
+                        // processing. The loop iterates over slots that
+                        // are not currently processing, so it finds zero
+                        // idle slots and is a natural no-op. The guard in
+                        // get_available_slot() handles the same case for
+                        // the back-to-back save+load path.
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
