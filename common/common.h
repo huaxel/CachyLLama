@@ -594,6 +594,12 @@ struct common_params {
     bool   moe_residency_prewarm   = true;   // prewarm top-K experts at startup
     int32_t moe_residency_top_k    = 16;     // prewarm K experts
     bool   moe_residency_log       = true;   // log hit rate every 16 decodes
+    // When true, periodically sample each tracked expert's pages via
+    // mincore() and log the physical residency ratio alongside the
+    // software policy state. Off by default - this is for development
+    // and correctness verification, not production. Requires Linux.
+    bool   moe_residency_debug     = false;  // sample mincore() per decode
+    int32_t moe_residency_debug_interval = 64; // decodes between samples
 
     bool single_turn       = false; // single turn chat conversation
 

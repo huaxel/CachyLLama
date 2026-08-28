@@ -2213,6 +2213,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 (moe_residency.decode_count % 16) == 0) {
                 llama_moe_residency_log_stats(&moe_residency);
             }
+            // Periodic mincore() sample (Linux only). Gated by
+            // debug_sample_interval > 0. Always off in production; for
+            // --moe-residency-debug to verify the policy actually
+            // changes which pages are resident.
+            if (moe_residency.cfg.debug_sample_interval > 0 &&
+                (moe_residency.decode_count %
+                 moe_residency.cfg.debug_sample_interval) == 0) {
+                llama_moe_residency_debug_sample(
+                    &moe_residency,
+                    moe_residency.cfg.debug_max_pages);
+            }
         }
 
         // Record per-layer selections into the co-activation matrix for
@@ -4837,6 +4848,8 @@ struct llama_moe_residency_config llama_moe_residency_config_default(void) {
     cfg.prewarm_on_init        = 1;
     cfg.prewarm_top_k          = 8;
     cfg.log_per_decode         = 1;
+    cfg.debug_sample_interval  = 0;
+    cfg.debug_max_pages        = 32;
     return cfg;
 }
 
@@ -4851,6 +4864,8 @@ int32_t llama_moe_residency_enable(
     icfg.prewarm_on_init        = cfg->prewarm_on_init != 0;
     icfg.prewarm_top_k          = (int) cfg->prewarm_top_k;
     icfg.log_per_decode         = cfg->log_per_decode != 0;
+    icfg.debug_sample_interval  = (int) cfg->debug_sample_interval;
+    icfg.debug_max_pages        = (int) cfg->debug_max_pages;
 
     ctx->expert_tracking_enabled = true;
     ctx->moe_residency.cfg = icfg;
@@ -4904,6 +4919,15 @@ void llama_moe_residency_stats_get(
     out->total_evicted    = ctx->moe_residency.total_evicted;
     out->decode_count     = ctx->moe_residency.decode_count;
     out->moe_layer_count  = (uint64_t) ctx->moe_residency.layers.size();
+    out->advice_success   = ctx->moe_residency.advice_success;
+    out->advice_failure   = ctx->moe_residency.advice_failure;
+    out->advice_einval    = ctx->moe_residency.advice_einval;
+    out->invalid_mapping  = ctx->moe_residency.invalid_mapping;
+#ifdef __linux__
+    out->uses_madv_cold   = true;
+#else
+    out->uses_madv_cold   = false;
+#endif
 }
 
 //

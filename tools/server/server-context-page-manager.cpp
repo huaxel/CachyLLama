@@ -14,12 +14,19 @@
 #include <chrono>
 #include <filesystem>
 #include <system_error>
+// hash_sha256_hex from vendor/hash/hash.h (linked via common::llama-common).
+#include "hash/hash.h"
 namespace fs = std::filesystem;
 
 namespace llama {
 
 // FNV-1a 64-bit hash of a byte string. Mirrors kv_ssd_hash_tokens in shape
 // but operates on raw bytes so it works for any string, not just tokens.
+//
+// DEPRECATED for user-isolation lookups: collisions are easy to construct
+// and we are using the result as a security boundary. The user cache
+// map now uses sha256_namespace_key() (see below). This is kept for the
+// in-process conversation hash code path which is not security-relevant.
 static uint64_t fnv1a_string(const std::string & s) {
     uint64_t h = 14695981039346656037ULL;
     for (unsigned char c : s) {
@@ -29,6 +36,27 @@ static uint64_t fnv1a_string(const std::string & s) {
     return h;
 }
 
+// SHA-256-based namespace key for user isolation. The first 8 bytes of
+// the digest are taken as a uint64_t; collisions in the truncated
+// digest are negligibly improbable and the security boundary no longer
+// depends on FNV-1a's distributional properties. The full hex digest is
+// used for the on-disk path so directory names carry the same entropy
+// as the underlying hash.
+static uint64_t sha256_namespace_key(const std::string & s) {
+    const std::string hex = hash_sha256_hex(s.data(), s.size());
+    // hex is 64 lowercase chars; take the first 16 as a uint64_t.
+    return std::stoull(hex.substr(0, 16), nullptr, 16);
+}
+
+// On-disk path uses the first 16 hex chars of the SHA-256 digest
+// (matching the kv_ssd_init conv_hash 16-char formatting). The
+// in-memory key is the same value reinterpreted as uint64_t. This
+// means the on-disk directory is not a copy of the raw user_id, and
+// the in-memory lookup key is the SHA-256 truncation.
+static std::string sha256_dir_token(const std::string & s) {
+    const std::string hex = hash_sha256_hex(s.data(), s.size());
+    return hex.substr(0, 16);
+}
 server_context_page_manager::server_context_page_manager(
     const char* ssd_path,
     const kv_eviction_config* cfg,
@@ -383,7 +411,7 @@ bool server_context_page_manager::find_matching_checkpoint(
     if (!user_id.empty()) {
         // user-scoped lookups never escape the user's own cache. cross-user
         // continuation matching is a privacy violation, so we skip it.
-        const uint64_t key = fnv1a_string(user_id);
+        const uint64_t key = sha256_namespace_key(user_id);
         server_ssd_cache* sc = get_or_create_user_cache(user_id);
         if (!sc) return false;
 
@@ -639,7 +667,7 @@ uint32_t server_context_page_manager::get_max_turn_id() const {
 server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const std::string& user_id) {
     if (user_id.empty()) return nullptr;
 
-    const uint64_t key = fnv1a_string(user_id);
+    const uint64_t key = sha256_namespace_key(user_id);
 
     auto it = user_wrappers_.find(key);
     if (it != user_wrappers_.end()) {
@@ -703,8 +731,12 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
     user_caches_[key] = std::move(cache_ptr);
     user_wrappers_[key] = std::move(wrapper);
 
-    LOG_INF("SSD cache: created new user cache user=%s key=%016lx (total=%zu)\n",
-             user_id.c_str(), (unsigned long)key, user_caches_.size());
+    // Do not log the raw user_id. The hash key is the only identifier
+    // operators need to correlate this log with a request; the raw
+    // value may be a PII-equivalent (e.g. an email-style opaque ID)
+    // and would be at rest in the log file.
+    LOG_INF("SSD cache: created new user cache key=%016lx (total=%zu)\n",
+             (unsigned long)key, user_caches_.size());
 
     return result;
 }

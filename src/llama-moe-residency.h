@@ -89,6 +89,17 @@ struct llama_moe_residency_internal_cfg {
     bool   prewarm_on_init       = true;
     int    prewarm_top_k         = 8;
     bool   log_per_decode        = true;
+
+    // When true, safe_madvise() logs the first EINVAL/ENOSYS per (advice,
+    // layer, expert) tuple and increments advice_failure counters. Set
+    // false for production builds where the failures are expected and the
+    // log volume would be excessive.
+    bool   log_advice_failures   = true;
+
+    // Linux-only debug knobs. Off by default; --moe-residency-debug.
+    // debug_sample_interval = 0 disables the periodic mincore() sample.
+    int    debug_sample_interval = 0;
+    int    debug_max_pages       = 32;
 };
 
 // Aggregate residency state. One entry per MoE layer.
@@ -104,6 +115,16 @@ struct llama_moe_residency_state {
     uint64_t total_evicted = 0;
     uint64_t total_touched = 0;
     uint64_t decode_count  = 0;
+
+    // madvise() observability. advice_success/advice_failure are counted
+    // per call to safe_madvise(); advice_einval counts the calls that the
+    // kernel rejected as not applicable to the mapping type (e.g. MADV_FREE
+    // on a MAP_SHARED file-backed mapping). invalid_mapping counts calls
+    // skipped because the region wasn't page-alignable.
+    uint64_t advice_success       = 0;
+    uint64_t advice_failure       = 0;
+    uint64_t advice_einval        = 0;
+    uint64_t invalid_mapping      = 0;
 };
 
 // Build the residency state from a loaded MoE model. Returns true and
@@ -167,3 +188,12 @@ bool llama_moe_residency_topk_from_stats(
         const struct llama_context * ctx,
         int k,
         std::vector<std::vector<int>> & out_top);
+
+// Linux-only: sample each tracked expert's pages via mincore() and log
+// the physical residency ratio alongside the policy state. Returns the
+// number of experts sampled. No-op on non-Linux platforms (returns 0).
+// max_pages_per_tensor caps the pages sampled per tensor to keep the
+// call O(1) - 0 means no cap.
+int llama_moe_residency_debug_sample(
+        const struct llama_moe_residency_state * st,
+        int max_pages_per_tensor);
