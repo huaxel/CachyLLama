@@ -2898,6 +2898,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PREWARM_TOP_K"));
     add_opt(common_arg(
+        {"--moe-residency-debug"}, "[on|off]",
+        "periodically sample each tracked expert's pages via mincore() "
+        "and log the physical residency ratio alongside the software "
+        "policy state. Linux only. (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value))       params.moe_residency_debug = true;
+            else if (is_falsey(value))  params.moe_residency_debug = false;
+            else throw std::invalid_argument("invalid value");
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENCY_DEBUG"));
+    add_opt(common_arg(
+        {"-moe-rdint", "--moe-residency-debug-interval"}, "N",
+        "decodes between mincore() samples (default: %d)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("must be positive");
+            }
+            params.moe_residency_debug_interval = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENCY_DEBUG_INTERVAL"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

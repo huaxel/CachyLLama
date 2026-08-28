@@ -1791,6 +1791,13 @@ extern "C" {
         uint8_t prewarm_on_init;        // prewarm at startup (0/1, default 1)
         uint32_t prewarm_top_k;          // experts to prewarm if no stats (default 8)
         uint8_t log_per_decode;         // log stats every N decodes (0/1, default 1)
+        // Linux-only. debug_sample_interval = 0 disables; positive
+        // values cause the residency layer to call mincore() on each
+        // tracked expert every N decodes and log the actual physical
+        // residency ratio. Use this to verify the software policy is
+        // actually changing which pages are resident.
+        uint32_t debug_sample_interval;  // default 0 (off)
+        uint32_t debug_max_pages;        // pages sampled per tensor (default 32)
     };
 
     // Return a config populated with sensible defaults.
@@ -1818,6 +1825,19 @@ extern "C" {
         uint64_t total_evicted;    // experts removed from LRU via MADV_DONTNEED
         uint64_t decode_count;     // total decode() calls observed
         uint64_t moe_layer_count;  // number of MoE layers in the model
+        // madvise() observability. Distinguishes "policy hit" (the LRU
+        // thought the expert was loaded) from "kernel actually accepted
+        // our madvise() advice". advice_einval > 0 means the kernel
+        // rejected the advice for the mapping type - the policy is not
+        // doing anything. See src/llama-moe-residency.cpp.
+        uint64_t advice_success;     // madvise() returned 0
+        uint64_t advice_failure;     // madvise() returned -1 (any errno)
+        uint64_t advice_einval;      // subset of failures: errno == EINVAL
+        uint64_t invalid_mapping;    // calls skipped (null/len=0/unalignable)
+        // Whether MADV_COLD or another cold-path advice is being used on
+        // the eviction path. Kept here for observability, not for callers
+        // to branch on.
+        bool     uses_madv_cold;
     };
 
     LLAMA_API void llama_moe_residency_stats_get(

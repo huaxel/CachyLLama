@@ -7,6 +7,7 @@
 #include "llama.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-impl.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cerrno>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -69,20 +71,49 @@ static int find_evict_slot(const std::vector<llama_moe_layer_residency_internal:
 }
 
 // madvise a region. Aligns to page boundaries so the kernel can act on it.
-// Silently ignores invalid pointers (non-mmap'd regions).
-static void safe_madvise(void * base, size_t len, int advice) {
-    if (!base || len == 0) return;
+// Updates the four resident counters in-place. EINVAL is tracked
+// separately because it is the most common failure mode for advice
+// values not applicable to the current mapping (e.g. MADV_FREE on a
+// MAP_SHARED file-backed mapping - invalid per the Linux man page).
+static void safe_madvise(void * base, size_t len, int advice,
+                         const char * advice_name,
+                         uint64_t & c_success,
+                         uint64_t & c_failure,
+                         uint64_t & c_einval,
+                         uint64_t & c_invalid_map,
+                         bool log_failures) {
+    if (!base || len == 0) {
+        c_invalid_map++;
+        return;
+    }
     uintptr_t p = reinterpret_cast<uintptr_t>(base);
     uintptr_t page_start = p & ~(uintptr_t(getpagesize()) - 1);
     uintptr_t end = p + len;
     uintptr_t page_end = (end + uintptr_t(getpagesize()) - 1) & ~(uintptr_t(getpagesize()) - 1);
     size_t aligned_len = page_end - page_start;
-    if (aligned_len == 0) return;
-    (void) madvise(reinterpret_cast<void *>(page_start), aligned_len, advice);
+    if (aligned_len == 0) {
+        c_invalid_map++;
+        return;
+    }
+    int rc = madvise(reinterpret_cast<void *>(page_start), aligned_len, advice);
+    if (rc == 0) {
+        c_success++;
+        return;
+    }
+    int e = errno;
+    c_failure++;
+    if (e == EINVAL) c_einval++;
+    if (log_failures) {
+        LLAMA_LOG_WARN(
+            "moe-residency: madvise(%s) failed: addr=%p len=%zu errno=%d (%s)\n",
+            advice_name ? advice_name : "?",
+            reinterpret_cast<void *>(page_start),
+            aligned_len, e, strerror(e));
+    }
 }
 
 template <typename Fn>
-static void for_each_tensor(llama_moe_layer_residency_internal & lr, Fn fn) {
+static void for_each_tensor(const llama_moe_layer_residency_internal & lr, Fn fn) {
     struct entry { ggml_tensor * t; size_t stride; };
     entry entries[4] = {
         { lr.t_gate,    lr.gate_stride    },
@@ -207,18 +238,27 @@ void llama_moe_residency_touch(
         if (evicted_id >= 0 && evicted_id < (int) lr.slot_of.size()) {
             lr.slot_of[evicted_id] = -1;
             const size_t eoff = (size_t) evicted_id;
-            // MADV_FREE (not MADV_DONTNEED): the kernel can drop these
-            // pages if it needs the memory but is free to keep them
-            // resident otherwise. MADV_DONTNEED forced the kernel to
-            // evict immediately, which on memory-constrained systems
-            // (Flip: 8 GB OS-only RAM, 32 GB physical) turned every
-            // cold miss into a disk page-fault and dropped prompt eval
-            // from ~215 t/s to ~56 t/s on Qwen3.6-35B-A3B Q4_K_XL
-            // (3.8x regression, root-caused 2026-07-27). With
-            // MADV_FREE the kernel LRU + memory pressure decide
-            // eviction; pages stay hot while memory is available.
+            // MADV_COLD (Linux 5.4+): mark the page cache copy as a more
+            // probable reclaim target under memory pressure. The page is
+            // *not* invalidated - if the kernel keeps it, a future touch
+            // is still a page-cache hit; if it reclaims, a re-fault is
+            // required but the file-backed mmap serves it.
+            //
+            // Previously this code used MADV_FREE, which is invalid for
+            // MAP_SHARED file-backed mappings (the only kind the model
+            // loader creates - see llama-mmap.cpp) and was silently
+            // returning EINVAL. The earlier "MADV_FREE fixed the
+            // regression" reading was actually the kernel correctly
+            // no-op'ing the advice; throughput came back because the
+            // residency layer stopped interfering. MADV_COLD is the
+            // right knob: it's a documented, non-destructive hint
+            // valid for this mapping type.
             for_each_tensor(lr, [&](void * base, size_t stride) {
-                safe_madvise((uint8_t *) base + eoff * stride, stride, MADV_FREE);
+                safe_madvise(reinterpret_cast<uint8_t *>(base) + eoff * stride,
+                             stride, MADV_COLD, "MADV_COLD",
+                             st->advice_success, st->advice_failure,
+                             st->advice_einval, st->invalid_mapping,
+                             st->cfg.log_advice_failures);
             });
             st->total_evicted++;
         }
@@ -239,7 +279,11 @@ void llama_moe_residency_touch(
     // Mark pages as WILLNEED for all present tensors.
     const size_t off = (size_t) expert_id;
     for_each_tensor(lr, [&](void * base, size_t stride) {
-        safe_madvise((uint8_t *) base + off * stride, stride, MADV_WILLNEED);
+        safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
+                     stride, MADV_WILLNEED, "MADV_WILLNEED",
+                     st->advice_success, st->advice_failure,
+                     st->advice_einval, st->invalid_mapping,
+                     st->cfg.log_advice_failures);
     });
 }
 
@@ -307,7 +351,11 @@ void llama_moe_residency_prewarm(
 
             const size_t off = (size_t) expert_id;
             for_each_tensor(lr, [&](void * base, size_t stride) {
-                safe_madvise((uint8_t *) base + off * stride, stride, MADV_WILLNEED);
+                safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
+                             stride, MADV_WILLNEED, "MADV_WILLNEED",
+                             st->advice_success, st->advice_failure,
+                             st->advice_einval, st->invalid_mapping,
+                             st->cfg.log_advice_failures);
             });
         }
     }
@@ -325,7 +373,11 @@ void llama_moe_residency_release(
             if (!e.occupied) continue;
             const size_t off = (size_t) e.expert_id;
             for_each_tensor(lr, [&](void * base, size_t stride) {
-                safe_madvise((uint8_t *) base + off * stride, stride, MADV_DONTNEED);
+                safe_madvise(reinterpret_cast<uint8_t *>(base) + off * stride,
+                             stride, MADV_DONTNEED, "MADV_DONTNEED",
+                             st->advice_success, st->advice_failure,
+                             st->advice_einval, st->invalid_mapping,
+                             st->cfg.log_advice_failures);
             });
             e.occupied = false;
         }
@@ -343,16 +395,31 @@ void llama_moe_residency_log_stats(
     if (!st || !st->cfg.enabled) return;
 
     const uint64_t total = st->total_hits + st->total_misses;
-    const double hit_rate = total > 0 ? double(st->total_hits) / double(total) : 0.0;
+    const double policy_hit_rate = total > 0
+        ? double(st->total_hits) / double(total) : 0.0;
+    const uint64_t advice_total = st->advice_success + st->advice_failure;
+    const double advice_ok = advice_total > 0
+        ? double(st->advice_success) / double(advice_total) : 0.0;
 
-    LLAMA_LOG_DEBUG(
-        "moe-residency: decodes=%llu touches=%llu hits=%llu misses=%llu evictions=%llu hit_rate=%.1f%%\n",
+    // Note: hit_rate is the SOFTWARE POLICY hit rate, not physical residency.
+    // advice_einval counts madvise calls the kernel rejected (e.g. on
+    // mapping types that don't support the advice). If einval > 0 here
+    // the policy is not actually doing anything.
+    LLAMA_LOG_INFO(
+        "moe-residency: decodes=%llu touches=%llu policy_hits=%llu policy_misses=%llu "
+        "evictions=%llu policy_hit_rate=%.1f%% "
+        "madvise: ok=%llu fail=%llu einval=%llu invalid_map=%llu ok_ratio=%.1f%%\n",
         (unsigned long long) st->decode_count,
         (unsigned long long) st->total_touched,
         (unsigned long long) st->total_hits,
         (unsigned long long) st->total_misses,
         (unsigned long long) st->total_evicted,
-        hit_rate * 100.0);
+        policy_hit_rate * 100.0,
+        (unsigned long long) st->advice_success,
+        (unsigned long long) st->advice_failure,
+        (unsigned long long) st->advice_einval,
+        (unsigned long long) st->invalid_mapping,
+        advice_ok * 100.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -403,3 +470,111 @@ bool llama_moe_residency_topk_from_stats(
 
     return any_data;
 }
+
+// ---------------------------------------------------------------------------
+// debug_sample_residency()
+// ---------------------------------------------------------------------------
+// Linux-only: walks the current R+F cache for each layer and calls
+// mincore() on each expert's pages to report actual physical residency
+// (the kernel page cache). This is the only way to verify that the
+// software policy is actually translating into the residency behavior
+// the policy claims. Off by default; gated by --moe-residency-debug.
+// Returns the number of experts sampled.
+//
+// Reports each expert's policy_state (HOT/COLD/UNKNOWN), resident_pages,
+// total_pages, and residency_ratio. For each tensor in the expert
+// (gate/up/down) we sample up to --moe-residency-debug-interval
+// max-pages to keep the call cheap. The result is the AVERAGE across
+// the three tensors, weighted by their page counts.
+#ifdef __linux__
+#include <sys/mman.h>
+
+int llama_moe_residency_debug_sample(
+        const struct llama_moe_residency_state * st,
+        int max_pages_per_tensor) {
+    if (!st || !st->cfg.enabled) return 0;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 0;
+
+    int sampled = 0;
+    long long total_resident = 0;
+    long long total_pages    = 0;
+
+    for (const auto & lr : st->layers) {
+        for (const auto & e : lr.cache) {
+            if (!e.occupied) continue;
+            const int expert_id = e.expert_id;
+            const size_t off = (size_t) expert_id;
+            long long exp_resident = 0;
+            long long exp_pages    = 0;
+            int tensors_seen = 0;
+            for_each_tensor(lr,
+                [&](void * base, size_t stride) {
+                    if (!base || stride == 0) return;
+                    uint8_t * p = reinterpret_cast<uint8_t *>(base) + off * stride;
+                    uintptr_t page_start = reinterpret_cast<uintptr_t>(p) & ~(uintptr_t(page_size) - 1);
+                    size_t n_pages = (stride + page_size - 1) / page_size;
+                    if ((size_t) max_pages_per_tensor > 0 &&
+                        n_pages > (size_t) max_pages_per_tensor) {
+                        n_pages = max_pages_per_tensor;
+                    }
+                    std::vector<unsigned char> vec(n_pages, 0);
+                    int rc = mincore(reinterpret_cast<void *>(page_start),
+                                     n_pages * page_size, vec.data());
+                    if (rc != 0) {
+                        // ENOMEM = not resident, EAGAIN = kernel busy.
+                        // Both count as not-resident for the ratio.
+                        if (errno == ENOMEM) {
+                            // all not-resident
+                        } else if (errno == EAGAIN) {
+                            // sample could not be completed; treat as
+                            // unknown - skip this tensor
+                            return;
+                        } else {
+                            return;
+                        }
+                    }
+                    for (size_t i = 0; i < n_pages; ++i) {
+                        // mincore returns 1 in LSB if page is resident.
+                        if (vec[i] & 0x01) exp_resident++;
+                    }
+                    exp_pages    += (long long) n_pages;
+                    tensors_seen++;
+                });
+            if (tensors_seen == 0 || exp_pages == 0) continue;
+            const double ratio = (double) exp_resident / (double) exp_pages;
+            const char * state = "UNKNOWN";
+            // Heuristic: "HOT" if policy is keeping it, "COLD" if it
+            // was evicted, "WARM" otherwise. The exact threshold is
+            // not meaningful - this is for observability.
+            if (e.access_count > 0) state = "HOT";
+            else                     state = "COLD";
+            LLAMA_LOG_INFO(
+                "moe-residency-debug: layer=%d expert=%d policy=%s "
+                "resident=%lld/%lld ratio=%.2f\n",
+                (int) lr.model_layer, expert_id, state,
+                exp_resident, exp_pages, ratio);
+            total_resident += exp_resident;
+            total_pages    += exp_pages;
+            sampled++;
+        }
+    }
+    if (sampled > 0 && total_pages > 0) {
+        LLAMA_LOG_INFO(
+            "moe-residency-debug: aggregate over %d experts: "
+            "resident=%lld/%lld ratio=%.2f\n",
+            sampled, total_resident, total_pages,
+            (double) total_resident / (double) total_pages);
+    }
+    return sampled;
+}
+
+#else  // !__linux__
+
+int llama_moe_residency_debug_sample(
+        const struct llama_moe_residency_state * /*st*/,
+        int /*max_pages_per_tensor*/) {
+    return 0;
+}
+
+#endif

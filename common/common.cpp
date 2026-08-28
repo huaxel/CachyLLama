@@ -1349,6 +1349,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         rcfg.prewarm_on_init        = params.moe_residency_prewarm ? 1 : 0;
         rcfg.prewarm_top_k          = (uint32_t) params.moe_residency_top_k;
         rcfg.log_per_decode         = params.moe_residency_log ? 1 : 0;
+        rcfg.debug_sample_interval  = params.moe_residency_debug
+            ? params.moe_residency_debug_interval : 0;
         llama_moe_residency_enable(lctx, &rcfg);
     }
 
