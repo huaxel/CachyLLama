@@ -84,8 +84,9 @@ public:
    llama_memory_recurrent * get_mem_recr() const;
 
     // Remove cells from attention cache only (for hybrid models where recurrent
-    // cache must be preserved). Returns true on success.
-    bool seq_rm_attn_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+    // cache must be preserved). Returns true on success. virtual so the qsa
+    // hybrid_idx subclass can extend it to also clear the indexer cache.
+    virtual bool seq_rm_attn_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
 
 private:
     const llama_hparams & hparams;
