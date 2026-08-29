@@ -541,6 +541,88 @@ suffix or are passed via CLI flags.
 
 ---
 
+## Memory and storage guarantees
+
+CachyLLama makes different kinds of claims about its optimizations, and they
+have different levels of support. When documenting or troubleshooting, use
+this three-way distinction:
+
+### Things CachyLLama actually guarantees
+
+- An expert in the R+F cache was selected by the R+F algorithm as a good
+  candidate to keep resident.
+- A checkpoint on disk has the on-disk format we wrote (atomic write
+  succeeded).
+- An explicit user_id never matches another user_id's checkpoints
+  (namespace hash is per-user).
+
+### Things requested from the OS but not guaranteed
+
+- That `MADV_WILLNEED` actually caused pages to be paged in. The kernel
+  may already have them resident (so the call is a no-op), or may
+  ignore the hint.
+- That `MADV_COLD` actually caused the kernel to evict the page. The
+  kernel decides under memory pressure.
+- That the working set fits in physical RAM. We *try* to keep it
+  there, but a competing workload can evict our pages regardless.
+
+### Things observed on a particular machine
+
+- The `policy_hit_rate` reported in the per-decode log - the
+  LRU+R+F prediction accuracy. The number is correct but the
+  implication ("the kernel kept our pages") is not.
+- The aggregate residency ratio from `--moe-residency-debug` - the
+  actual physical residency, measured via `mincore()`. This is the
+  ground truth, but it is specific to the workload, hardware, and
+  competing memory pressure at the time of measurement.
+
+### Verifying residency is doing what it claims
+
+Run the model with `--moe-residency-debug` (Linux only). The per-decode
+log line shows `policy_hit_rate` and the per-debug-interval line shows
+the `aggregate ... ratio` (real physical residency). The two should
+track each other within a few percent on hardware without competing
+memory pressure. If `policy_hit_rate` is high but `aggregate ratio` is
+low, the kernel is evicting pages we asked it to keep and the policy
+is not doing anything. If `advice_einval` in the per-decode summary
+is non-zero, the kernel is rejecting the `madvise()` advice outright
+and the policy is definitely not doing anything.
+
+### Verifying SSD cache is doing what it claims
+
+Check that the `kv-ssd` on-disk directory uses the expected conv_hash
+or SHA-256 user_id prefix (not a raw user_id). For atomic-write
+guarantees, kill the server with `kill -9` mid-checkpoint-write and
+verify that the prior valid index is recoverable on next startup.
+The `tests/test-kv-ssd-user-isolation` binary exercises both
+properties without needing a real model.
+
+### Independently disabling optimizations
+
+Each CachyLLama-specific optimization can be disabled in isolation so
+that a regression can be bisected to a single cause. The flags:
+
+- `--no-moe-expert-residency` - disables the MoE expert madvise layer.
+  Tracking remains on; the R+F cache and the touch path are skipped.
+- `--cache-ssd` / `--no-cache-ssd` - enables or disables the SSD
+  checkpoint cache. The default is "auto" (enabled when the model is
+  large enough to benefit).
+- `--no-mmap` - implicit: requires `--no-moe-expert-residency` because
+  the madvise layer operates on the mmap'd model file.
+- `LLAMA_ARG_NO_FSYNC=1` - skips the fsync on checkpoint writes for
+  lower write latency at the cost of losing the last checkpoint on
+  crash. Use only for benchmarking, not production.
+- `GGML_VK_NODES_PER_SUBMIT=N` - Vulkan command-buffer batching. The
+  APU default is 8; discrete GPU default is 100. Override when
+  debugging a specific backend issue.
+
+If a workload regresses, the developer should be able to disable
+exactly one optimization and see the regression go away. If two
+optimizations share a flag, file a bug - the dependency should be
+broken.
+
+---
+
 ## Vulkan init-order critical: Lightning Indexer and DSV4_HC
 
 On devices that enable `VK_EXT_subgroup_size_control` (Strix Halo, RDNA3

@@ -127,6 +127,20 @@ void server_context_page_manager::set_model_info(const struct llama_model* model
 
     model_compat_hash_ = h;
 
+    // Compute v4 metadata. model_identity is the same arch-dims-cache-types
+    // hash used for compat_hash; we keep them as separate fields so the
+    // v4 on-disk format can distinguish "this model is in a different
+    // family" (identity mismatch) from "this model is the same family
+    // but a different commit" (compat_hash mismatch). The header writes
+    // both; readers reject either mismatch as a clean miss.
+    //
+    // model_hash is the GGUF content hash. We don't have it here
+    // (computing it would require reading the full GGUF); leave 0.
+    // Setting it would require extending llama_model_loader to
+    // expose the content hash from the GGUF v3 metadata block.
+    config_.model_identity = h;
+    config_.model_hash     = 0;  // not yet wired upstream
+
     // Set compat_hash on any already-created cache instances
     for (auto& [conv, wrapper] : conv_wrappers_) {
         wrapper->set_compat_hash(h);
