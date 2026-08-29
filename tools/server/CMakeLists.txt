@@ -52,6 +52,10 @@ set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd ${PROJECT_SOURCE_DIR})
+# LLAMA_BUILD_UI is always linked here; define the macro so the #ifdef
+# LLAMA_BUILD_UI guards in server-http.cpp are actually true (else the
+# embedded frontend 404s even though llama-ui is linked). See issue #13.
+target_compile_definitions(${TARGET} PUBLIC LLAMA_BUILD_UI)
 target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 add_dependencies(${TARGET} llama-ui-assets)
