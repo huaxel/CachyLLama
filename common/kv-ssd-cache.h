@@ -35,6 +35,13 @@ struct kv_ssd_config {
     int max_cold_checkpoints = 32;  // Max checkpoints per model (ring buffer cap)
     float memory_reserve     = 0.15f;
     bool no_fsync            = false; // Skip fsync on write (faster, may lose last checkpoint on crash)
+    // v4: model identity fields written to the index header and every
+    // per-checkpoint header. Used to reject caches whose underlying
+    // model no longer matches the on-disk metadata. Set both to 0 to
+    // skip validation (legacy behavior).
+    uint64_t model_identity  = 0; // hash(arch, dims, cache types)
+    uint64_t model_hash      = 0; // content hash of the GGUF
+    uint32_t quantization    = 0; // ggml_type of the primary weight tensor
 };
 
 // Checkpoint metadata (in-memory index entry)
@@ -56,6 +63,12 @@ struct kv_ssd_checkpoint {
     uint64_t last_access;   // Timestamp ms of last access
     uint32_t access_count;  // Number of times accessed
     std::vector<uint32_t> token_prefix; // First N tokens for matching (cached in RAM)
+    // v4: per-checkpoint copy of the cache's model identity. Allows
+    // rejecting a checkpoint whose model no longer matches the active
+    // model, even if the index file is intact (e.g. model swap).
+    uint64_t model_identity = 0;
+    uint32_t quantization   = 0;
+    uint64_t model_hash     = 0;
 };
 
 // Index file header (written to {MODEL}/index.bin)
@@ -64,14 +77,31 @@ struct kv_ssd_index_header {
     uint32_t version;       // Format version
     uint64_t next_id;       // Next checkpoint ID to allocate
     uint64_t compat_hash;   // Model compatibility hash
-    uint64_t reserved[12];  // Future use
+    // v4 fields. `reserved[]` was a generic future-use slot in v3; in
+    // v4 the first 9 of the 12 slots are now defined. Readers must
+    // validate magic + version (== KV_SSD_VERSION) before reading any
+    // of these.
+    uint32_t cache_format_version;  // KV_SSD_CACHE_FORMAT_VERSION
+    uint32_t quantization;          // GGUF quantization (ggml_type)
+    uint64_t model_identity;        // hash(arch, dims, cache types) -
+                                    // identifies the model *family*
+                                    // independent of compat_hash
+    uint64_t model_hash;            // content hash of the GGUF file
+                                    // (or 0 if not computed)
+    uint64_t payload_size;          // bytes in the index file after
+                                    // the header (currently 0 - index
+                                    // is a fixed-size record; reserved
+                                    // for future per-cache metadata)
+    uint64_t header_checksum;       // FNV-1a over the prior header
+                                    // bytes; detects on-disk corruption
+    uint64_t reserved[3];           // Future use
 };
 
 // Maximum tokens stored per checkpoint for prefix matching
 #define KV_SSD_TOKEN_PREFIX_MAX 4096
 
 // Per-checkpoint file header (fixed size, followed by checkpoint data)
-// v3 layout: [kv_ssd_record][tgt_data][dft_data][spec_data]
+// v4 layout: [kv_ssd_record][tgt_data][dft_data][spec_data]
 // data_size = tgt bytes; dft_data_size/spec_data_size = optional extra blobs (0 = absent)
 struct kv_ssd_record {
     uint32_t magic;         // KV_SSD_MAGIC_REC
@@ -89,6 +119,15 @@ struct kv_ssd_record {
     uint32_t token_prefix[KV_SSD_TOKEN_PREFIX_MAX]; // First N tokens
     uint64_t dft_data_size; // MTP/draft context bytes appended after tgt_data (0 = none)
     uint64_t spec_data_size;// Speculative impl state bytes appended after dft_data (0 = none)
+    // v4 metadata (mirrors kv_ssd_index_header). Carried per-checkpoint
+    // so an individual checkpoint can be rejected even if the index
+    // is intact (e.g. when restoring after a model file swap).
+    uint32_t cache_format_version;
+    uint32_t quantization;
+    uint64_t model_identity;
+    uint64_t model_hash;
+    uint64_t payload_size;      // bytes after this header in this file
+    uint64_t header_checksum;   // FNV-1a over the prior header bytes
 };
 
 class kv_ssd_cache {
@@ -103,6 +142,13 @@ public:
     std::string base_path;          // e.g. ssd-cache/
     std::string model_dir;          // e.g. ssd-cache/{CONV_HASH}/
     uint64_t conv_hash = 0;         // This cache's conversation identity
+    // v4: cached copy of the v4 metadata fields. Populated from
+    // kv_ssd_config on init, then refreshed from the on-disk index
+    // header on read_index_file. Used as the source of truth for
+    // per-checkpoint header writes and for downstream validation.
+    uint64_t model_identity = 0;
+    uint32_t quantization   = 0;
+    uint64_t model_hash     = 0;
     kv_ssd_config config;
     bool initialized = false;
 

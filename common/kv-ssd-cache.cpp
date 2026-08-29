@@ -31,7 +31,17 @@
 // Magic numbers
 static const uint32_t KV_SSD_MAGIC_INDEX = 0x4B564944; // "KVID"
 static const uint32_t KV_SSD_MAGIC_REC   = 0x4B565243; // "KVRC"
-static const uint32_t KV_SSD_VERSION     = 3;           // v3 = per-file format + dft/spec blobs
+// v3 = per-file format + dft/spec blobs
+// v4 = extended metadata (model_identity, model_hash, quantization,
+//      payload_size, header_checksum) in index header and per-checkpoint
+//      header. Bumping the version forces a clean miss for v3 caches
+//      rather than attempting to deserialize incompatible state.
+//      KV_SSD_CACHE_FORMAT_VERSION is the inner version of the cache
+//      contents payload (currently 1, bumped only when the payload
+//      layout itself changes - rare). The header version is
+//      KV_SSD_VERSION.
+static const uint32_t KV_SSD_VERSION              = 4;
+static const uint32_t KV_SSD_CACHE_FORMAT_VERSION = 1;
 
 // =============================================================================
 // Internal helpers
@@ -129,6 +139,95 @@ static std::string index_path(const kv_ssd_cache* c) {
     return c->model_dir + "/index.bin";
 }
 
+// FNV-1a 64-bit hash of a contiguous byte range. Used for header
+// checksums (corruption detection, not authentication). A non-cryptographic
+// hash is the right primitive here: this is verifying that bytes on
+// disk still match what was written, not authenticating the writer.
+static uint64_t fnv1a_bytes(const void * data, size_t count) {
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < count; ++i) {
+        h ^= (uint64_t) p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// Write `data` (size bytes) atomically to `path`. The implementation:
+//   1. Open {path}.tmp with O_WRONLY | O_CREAT | O_EXCL (no clobber).
+//   2. Write the data.
+//   3. fsync the data file so its contents are durable.
+//   4. Close the fd.
+//   5. std::filesystem::rename {path}.tmp -> {path} (atomic on the
+//      same filesystem on POSIX; on Windows, MoveFileEx semantics).
+//   6. If a parent-directory fsync is requested and supported, fsync
+//      the parent so the rename is durable across a crash.
+//
+// If the process dies between any of these steps, the destination
+// file is left untouched (the prior contents remain valid) and the
+// orphan {path}.tmp can be deleted on next startup.
+//
+// Returns true on success, false on any I/O failure (in which case
+// the temp file is removed).
+static bool atomic_write_file(const std::string & path,
+                              const void * data, size_t size,
+                              bool do_fsync = true) {
+    namespace fs = std::filesystem;
+    const std::string tmp = path + ".tmp";
+    // Best-effort cleanup of a stale tmp from a prior crashed write.
+    // Errors here are non-fatal.
+    std::error_code ec;
+    fs::remove(tmp, ec);
+
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        int se = errno;
+        LOG_WRN("SSD cache: atomic_write open(%s) failed: %s (errno=%d)\n",
+                tmp.c_str(), strerror(se), se);
+        return false;
+    }
+    if (!pwrite_all(fd, data, size, 0)) {
+        int se = errno;
+        LOG_WRN("SSD cache: atomic_write pwrite(%s) failed: %s (errno=%d)\n",
+                tmp.c_str(), strerror(se), se);
+        ::close(fd);
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    if (do_fsync) {
+        ::fsync(fd);
+    }
+    ::close(fd);
+    // rename(2) on POSIX is atomic on the same filesystem.
+    std::error_code ren_ec;
+    fs::rename(tmp, path, ren_ec);
+    if (ren_ec) {
+        LOG_WRN("SSD cache: atomic_write rename(%s -> %s) failed: %s\n",
+                tmp.c_str(), path.c_str(), ren_ec.message().c_str());
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    // Best-effort parent-dir fsync. Not all filesystems support this;
+    // ignore ENOTSUP / EINVAL.
+    if (do_fsync) {
+        const fs::path parent = fs::path(path).parent_path();
+        if (!parent.empty()) {
+            int pfd = ::open(parent.string().c_str(), O_RDONLY);
+            if (pfd >= 0) {
+                if (::fsync(pfd) != 0) {
+                    // ENOTSUP on some filesystems (e.g. tmpfs) - fine.
+                    if (errno != ENOTSUP && errno != EINVAL) {
+                        LOG_DBG("SSD cache: parent fsync(%s) errno=%d (%s)\n",
+                                parent.string().c_str(), errno, strerror(errno));
+                    }
+                }
+                ::close(pfd);
+            }
+        }
+    }
+    return true;
+}
+
 // Hint to the kernel that a checkpoint file will be needed soon.
 // On Linux, uses posix_fadvise(POSIX_FADV_WILLNEED) to trigger
 // async page cache prefetch. On other platforms, uses readahead().
@@ -182,20 +281,22 @@ static bool write_index_file(kv_ssd_cache* c) {
     hdr.version = KV_SSD_VERSION;
     hdr.next_id = c->next_id;
     hdr.compat_hash = c->compat_hash;
+    hdr.cache_format_version = KV_SSD_CACHE_FORMAT_VERSION;
+    hdr.quantization        = c->config.quantization;
+    hdr.model_identity      = c->config.model_identity;
+    hdr.model_hash          = c->config.model_hash;
+    hdr.payload_size        = 0;  // index is fixed-size for now
+    // FNV-1a over the header bytes with the checksum field zeroed. The
+    // checksum is at a fixed offset; the prior zeroed state means
+    // recomputing after the actual write gives a stable value.
+    hdr.header_checksum = 0;
+    hdr.header_checksum = fnv1a_bytes(&hdr, sizeof(hdr));
 
-    std::string path = index_path(c);
-    int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        int se = errno;
-        LOG_WRN("SSD cache: failed to write index: %s (errno=%d" SSD_WIN32_ERR_FMT ")\n", strerror(se), se SSD_WIN32_ERR_ARG);
-        return false;
-    }
-    bool ok = pwrite_all(fd, &hdr, sizeof(hdr), 0);
-    if (!c->config.no_fsync) {
-        fsync(fd);
-    }
-    close(fd);
-    return ok;
+    // Atomic write: tmp + fsync + rename, so a SIGKILL mid-write
+    // leaves the prior index file intact. See atomic_write_file().
+    const std::string path = index_path(c);
+    return atomic_write_file(path, &hdr, sizeof(hdr),
+                             /*do_fsync=*/!c->config.no_fsync);
 }
 
 // Read the index file. Returns false if not found or invalid.
@@ -209,8 +310,40 @@ static bool read_index_file(kv_ssd_cache* c) {
     close(fd);
     if (!ok || hdr.magic != KV_SSD_MAGIC_INDEX || hdr.version != KV_SSD_VERSION) return false;
 
+    // Validate the v4 metadata if the writer set it. A zero
+    // model_identity in either the header or the config means the
+    // field is unset and we skip the check (legacy behavior).
+    if (c->config.model_identity != 0 && hdr.model_identity != 0 &&
+        hdr.model_identity != c->config.model_identity) {
+        LOG_WRN("SSD cache: index model_identity mismatch "
+                "(header=0x%016llx expected=0x%016llx) - clean miss\n",
+                (unsigned long long) hdr.model_identity,
+                (unsigned long long) c->config.model_identity);
+        return false;
+    }
+
+    // Validate header checksum. If the writer set it, we require it
+    // to match; otherwise (zero) we skip.
+    if (hdr.header_checksum != 0) {
+        kv_ssd_index_header tmp = hdr;
+        tmp.header_checksum = 0;
+        const uint64_t expected = fnv1a_bytes(&tmp, sizeof(tmp));
+        if (expected != hdr.header_checksum) {
+            LOG_WRN("SSD cache: index header checksum mismatch "
+                    "(stored=0x%016llx computed=0x%016llx) - corrupted\n",
+                    (unsigned long long) hdr.header_checksum,
+                    (unsigned long long) expected);
+            return false;
+        }
+    }
+
     c->next_id = hdr.next_id;
     if (c->compat_hash == 0) c->compat_hash = hdr.compat_hash;
+    // Cache the metadata for downstream consumers (per-checkpoint
+    // files inherit it; mismatched files will be rejected).
+    if (c->model_identity == 0) c->model_identity = hdr.model_identity;
+    if (c->quantization    == 0) c->quantization    = hdr.quantization;
+    if (c->model_hash      == 0) c->model_hash      = hdr.model_hash;
     return true;
 }
 
@@ -223,6 +356,42 @@ static bool load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
     bool ok = pread_all(fd, &rec, sizeof(rec), 0);
     close(fd);
     if (!ok || rec.magic != KV_SSD_MAGIC_REC) return false;
+    // Reject per-checkpoint v3/v4 mismatches. v3 records are not
+    // compatible with the v4 reader because the v4 fields overlap
+    // the v3 reserved slot and would be read as garbage. Clean
+    // miss is the right behavior.
+    if (rec.version != KV_SSD_VERSION) return false;
+    // Header checksum validation. Skip if the writer didn't set one
+    // (zero), require a match if it did.
+    if (rec.header_checksum != 0) {
+        kv_ssd_record tmp = rec;
+        tmp.header_checksum = 0;
+        const uint64_t expected = fnv1a_bytes(&tmp, sizeof(tmp));
+        if (expected != rec.header_checksum) {
+            LOG_WRN("SSD cache: checkpoint %s header checksum mismatch "
+                    "(stored=0x%016llx computed=0x%016llx) - corrupted\n",
+                    filepath.c_str(),
+                    (unsigned long long) rec.header_checksum,
+                    (unsigned long long) expected);
+            return false;
+        }
+    }
+    // Per-checkpoint model identity check. If either the cache config
+    // or the checkpoint header carries a non-zero identity and they
+    // differ, reject the checkpoint. A legacy v4 record may have
+    // identity == 0 (writer didn't set it) - we accept those for
+    // backwards compatibility within v4, but the index header must
+    // still match (enforced in read_index_file).
+    if (rec.model_identity != 0 &&
+        c->model_identity != 0 &&
+        rec.model_identity != c->model_identity) {
+        LOG_DBG("SSD cache: checkpoint %s model_identity 0x%016llx "
+                "does not match cache 0x%016llx - skipping\n",
+                filepath.c_str(),
+                (unsigned long long) rec.model_identity,
+                (unsigned long long) c->model_identity);
+        return false;
+    }
 
     // Build index entry
     kv_ssd_checkpoint ckpt;
@@ -242,6 +411,9 @@ static bool load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
     ckpt.spec_data_size = (size_t)rec.spec_data_size;
     ckpt.last_access = 0;
     ckpt.access_count = 0;
+    ckpt.model_identity = rec.model_identity;
+    ckpt.quantization   = rec.quantization;
+    ckpt.model_hash     = rec.model_hash;
 
     if (rec.token_count > 0) {
         ckpt.token_prefix.assign(rec.token_prefix, rec.token_prefix + rec.token_count);
@@ -491,6 +663,36 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
         close(fd);
         return false;
     }
+    // v4: also reject the read on version mismatch or checksum
+    // failure. Same rules as the index load - corrupt or
+    // version-incompatible checkpoints are treated as a clean miss.
+    if (rec.version != KV_SSD_VERSION) {
+        LOG_WRN("SSD cache: checkpoint id=%lu version=%u (expected %u) - skipping\n",
+                (unsigned long) id, rec.version, KV_SSD_VERSION);
+        close(fd);
+        return false;
+    }
+    if (rec.header_checksum != 0) {
+        kv_ssd_record tmp = rec;
+        tmp.header_checksum = 0;
+        const uint64_t expected = fnv1a_bytes(&tmp, sizeof(tmp));
+        if (expected != rec.header_checksum) {
+            LOG_WRN("SSD cache: checkpoint id=%lu header checksum mismatch - corrupted\n",
+                    (unsigned long) id);
+            close(fd);
+            return false;
+        }
+    }
+    if (rec.model_identity != 0 && c->model_identity != 0 &&
+        rec.model_identity != c->model_identity) {
+        LOG_WRN("SSD cache: checkpoint id=%lu model_identity 0x%016llx "
+                "does not match active model 0x%016llx - skipping\n",
+                (unsigned long) id,
+                (unsigned long long) rec.model_identity,
+                (unsigned long long) c->model_identity);
+        close(fd);
+        return false;
+    }
 
     const size_t tgt_size  = (size_t)rec.data_size;
     const size_t dft_size  = (size_t)rec.dft_data_size;
@@ -534,6 +736,11 @@ kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t c
     kv_ssd_cache* c = new kv_ssd_cache();
     if (cfg) c->config = *cfg;
     c->conv_hash = conv_hash;
+    // Carry v4 metadata into the cache state. read_index_file() may
+    // refresh these from the on-disk index header.
+    c->model_identity = c->config.model_identity;
+    c->quantization   = c->config.quantization;
+    c->model_hash     = c->config.model_hash;
 
     // Auto-size RAM budgets
     if (c->config.auto_size) {
@@ -658,56 +865,34 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     }
     rec.dft_data_size  = (dft_data  && dft_data_size  > 0) ? dft_data_size  : 0;
     rec.spec_data_size = (spec_data && spec_data_size > 0) ? spec_data_size : 0;
+    // v4 metadata. Inherits from the cache-level fields populated
+    // from kv_ssd_config; if those are 0 the per-checkpoint fields
+    // are also 0 and the read path skips the check.
+    rec.cache_format_version = KV_SSD_CACHE_FORMAT_VERSION;
+    rec.quantization        = cache->quantization;
+    rec.model_identity      = cache->model_identity;
+    rec.model_hash          = cache->model_hash;
+    rec.payload_size        = data_size + rec.dft_data_size + rec.spec_data_size;
+    rec.header_checksum     = 0;
+    rec.header_checksum     = fnv1a_bytes(&rec, sizeof(rec));
 
-    // Write checkpoint file: [header][tgt_data][dft_data][spec_data]
+    // Write checkpoint file atomically: build the full file in memory
+    // then tmp + fsync + rename. Previously this used O_TRUNC + a
+    // series of pwrite_all calls, which could leave a half-written
+    // file if the process died between any of the writes. See
+    // atomic_write_file().
     std::string filepath = ckpt_path(cache, id);
-    int fd = open(filepath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        int se = errno;
-        LOG_WRN("SSD cache: failed to create %s: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u)\n",
-                filepath.c_str(), strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id);
-        cache->next_id--;
-        return 0;
-    }
-
-    bool ok = true;
-    int64_t off = 0;
-    if (!pwrite_all(fd, &rec, sizeof(rec), off)) {
-        int se = errno;
-        LOG_WRN("SSD cache: failed to write record header: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u)\n",
-                strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id);
-        ok = false;
-    }
-    off += (int64_t)sizeof(kv_ssd_record);
-    if (ok && !pwrite_all(fd, data, data_size, off)) {
-        int se = errno;
-        LOG_WRN("SSD cache: failed to write checkpoint data: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u, size=%zu, off=%jd)\n",
-                strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id, data_size, (intmax_t)off);
-        ok = false;
-    }
-    off += (int64_t)data_size;
-    if (ok && rec.dft_data_size > 0 && !pwrite_all(fd, dft_data, rec.dft_data_size, off)) {
-        int se = errno;
-        LOG_WRN("SSD cache: failed to write dft data: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u, size=%llu, off=%jd)\n",
-                strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id,
-                (unsigned long long)rec.dft_data_size, (intmax_t)off);
-        ok = false;
-    }
-    off += (int64_t)rec.dft_data_size;
-    if (ok && rec.spec_data_size > 0 && !pwrite_all(fd, spec_data, rec.spec_data_size, off)) {
-        int se = errno;
-        LOG_WRN("SSD cache: failed to write spec data: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u, size=%llu, off=%jd)\n",
-                strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id,
-                (unsigned long long)rec.spec_data_size, (intmax_t)off);
-        ok = false;
-    }
-    if (!cache->config.no_fsync) {
-        fsync(fd);
-    }
-    close(fd);
-
-    if (!ok) {
-        unlink(filepath.c_str());
+    const size_t total_payload =
+        sizeof(kv_ssd_record) + data_size + rec.dft_data_size + rec.spec_data_size;
+    std::vector<uint8_t> file_buf;
+    file_buf.resize(total_payload);
+    uint8_t * wp = file_buf.data();
+    memcpy(wp, &rec, sizeof(kv_ssd_record)); wp += sizeof(kv_ssd_record);
+    if (data_size > 0) { memcpy(wp, data, data_size); wp += data_size; }
+    if (rec.dft_data_size  > 0) { memcpy(wp, dft_data,  rec.dft_data_size);  wp += rec.dft_data_size;  }
+    if (rec.spec_data_size > 0) { memcpy(wp, spec_data, rec.spec_data_size); wp += rec.spec_data_size; }
+    if (!atomic_write_file(filepath, file_buf.data(), file_buf.size(),
+                          /*do_fsync=*/!cache->config.no_fsync)) {
         cache->next_id--;
         return 0;
     }
@@ -1110,6 +1295,11 @@ uint64_t kv_ssd_find_continuation(
         bool ok = pread_all(fd, &hdr, sizeof(hdr), 0);
         close(fd);
         if (!ok || hdr.magic != KV_SSD_MAGIC_INDEX) continue;
+        // Only scan caches whose on-disk version matches the running
+        // version. Older versions are a clean miss; newer versions
+        // imply an upgraded-downgraded binary mismatch and are also
+        // rejected.
+        if (hdr.version != KV_SSD_VERSION) continue;
 
         // Skip directories with mismatched model config
         if (compat_hash != 0 && hdr.compat_hash != 0 && hdr.compat_hash != compat_hash) continue;
@@ -1216,7 +1406,9 @@ uint32_t kv_ssd_get_max_turn_id_global(const char* base_path) {
             kv_ssd_record rec;
             bool rok = pread_all(cfd, &rec, sizeof(rec), 0);
             close(cfd);
-            if (rok && rec.magic == KV_SSD_MAGIC_REC && rec.turn_created > max_turn) {
+            if (rok && rec.magic == KV_SSD_MAGIC_REC &&
+                rec.version == KV_SSD_VERSION &&
+                rec.turn_created > max_turn) {
                 max_turn = rec.turn_created;
             }
         }
