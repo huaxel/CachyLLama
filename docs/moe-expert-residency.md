@@ -1,6 +1,24 @@
 # MoE Expert Residency
 
-Enable running Mixture-of-Experts (MoE) models whose total footprint exceeds available system RAM by keeping only the active expert subset paged in and letting cold expert pages spill to the SSD via `madvise`. On Linux with NVMe, the kernel handles the actual I/O through the page cache; CachyLLama just steers it via `MADV_WILLNEED` / `MADV_DONTNEED` hints.
+Enable running Mixture-of-Experts (MoE) models whose total footprint exceeds available system RAM by keeping only the active expert subset paged in and letting cold expert pages spill to the SSD via `madvise`. On Linux with NVMe, the kernel handles the actual I/O through the page cache; CachyLLama just steers it via `MADV_WILLNEED` (hot path) and `MADV_COLD` (cold path) hints.
+
+## Policy vs. physical residency
+
+CachyLLama controls a *software policy* (which experts should be in the working set). The Linux kernel controls *physical residency* (which pages are actually in RAM). These are not the same thing:
+
+- `madvise()` is advisory. The kernel is free to ignore the hint, evict pages anyway, or keep cold pages resident under low memory pressure.
+- An expert is "loaded" in our cache the moment we call `MADV_WILLNEED` on it - but the kernel may have already had those pages resident (so the call is a no-op), or may have decided to evict them despite the hint.
+- A 95% "hit rate" reported by the residency layer is the *software policy hit rate* - it tells you the LRU predicted the right experts to keep, not that the kernel kept them.
+
+To actually measure physical residency, use `--moe-residency-debug` (Linux only) which periodically calls `mincore()` on each tracked expert and logs the resident/total page ratio. If that ratio is much lower than the policy hit rate, the kernel is evicting pages we asked it to keep - and the policy is not actually doing anything.
+
+The `llama_moe_residency_stats_get()` API exposes both views:
+
+- `total_hits / total_misses` - software policy hits and misses
+- `advice_success / advice_failure / advice_einval` - whether the kernel actually accepted each `madvise()` call
+- `invalid_mapping` - calls skipped because the region wasn't page-alignable
+
+`advice_einval > 0` is the most important signal: it means the kernel rejected the advice for the mapping type, and the policy is silently no-oping. If you see this, the advice value being used is invalid for the model's `mmap()` layout.
 
 ## Overview
 
@@ -23,14 +41,16 @@ All five models load successfully. The 12 GB gpt-oss runs at normal speed. Large
 The subsystem has three pieces:
 
 1. **Per-token expert selection capture** — `track_expert_activations()` reads the MoE routing tensors (`ffn_moe_argsort-<layer>`, `ffn_moe_topk-<layer>`, or `ffn_moe_probs-<layer>`) from the compute graph after each decode and stores the top-K selected expert IDs per layer in `llama_context::expert_stats`.
-2. **Per-layer recency+frequency cache** — a fixed-size pool of expert slots per MoE layer. Each decode's selection touches the relevant slots (marking them hot), promotes them by recency/frequency score, and evicts the lowest-scoring slot via `MADV_DONTNEED` when the layer's resident set overflows.
+2. **Per-layer recency+frequency cache** — a fixed-size pool of expert slots per MoE layer. Each decode's selection touches the relevant slots (marking them hot), promotes them by recency/frequency score, and evicts the lowest-scoring slot via `MADV_COLD` when the layer's resident set overflows.
 3. **Cross-session co-activation matrix** — records per-layer and cross-layer expert co-firing counts. Saved to `~/.cachylla/coactivation/{model}.json` on context destruction; reloaded on init. Used to inform future prewarm decisions and (in Phase 2+ planning) predictive prefetch.
 
 ### Why `madvise` and not explicit `pread`
 
-NVMe SSDs have very high random read performance (millions of IOPS for small reads, GB/s for sequential). The `madvise` + `MADV_WILLNEED` + `MADV_DONTNEED` path lets the kernel's existing page cache machinery do the I/O, with readahead, write coalescing, and eviction policy that are already well-tuned for NVMe. We don't need explicit `pread()` workers or a custom buffer pool — the kernel does it for us at near-zero overhead.
+NVMe SSDs have very high random read performance (millions of IOPS for small reads, GB/s for sequential). The `madvise` + `MADV_WILLNEED` + `MADV_COLD` path lets the kernel's existing page cache machinery do the I/O, with readahead, write coalescing, and eviction policy that are already well-tuned for NVMe. We don't need explicit `pread()` workers or a custom buffer pool — the kernel does it for us at near-zero overhead.
 
-The trade-off: `madvise` is advisory. The kernel can ignore hints under memory pressure. We measure 99.5%+ hit rate in steady state on tested models, which is the practical limit of this approach.
+The trade-off: `madvise` is advisory. The kernel can ignore hints under memory pressure. We measure 99.5%+ *policy hit rate* in steady state on tested models, which is the practical limit of the LRU+R+F prediction; the physical residency rate (measured with `--moe-residency-debug`) tracks the same number on hardware that doesn't have competing memory pressure.
+
+We use `MADV_WILLNEED` on the hot path and `MADV_COLD` on the cold path. Earlier versions used `MADV_DONTNEED` and `MADV_FREE`; both are inappropriate here. `MADV_DONTNEED` is destructive on file-backed mappings (the kernel re-faults from disk on next access, which on Flip-tier hardware turned cold misses into disk page faults and dropped prefill from ~215 t/s to ~56 t/s on a 20 GB MoE model). `MADV_FREE` is rejected with `EINVAL` on the model's `MAP_SHARED | PROT_READ` mapping - the Linux man page is explicit that `MADV_FREE` applies only to *private anonymous* pages. `MADV_COLD` (Linux 5.4+) is the right tool: it is non-destructive (no re-fault needed if the kernel keeps the page) and is valid for file-backed shared mappings.
 
 ## CLI flags
 
@@ -38,9 +58,13 @@ The trade-off: `madvise` is advisory. The kernel can ignore hints under memory p
 --moe-expert-residency / --no-moe-expert-residency   master switch (default: disabled)
 --moe-resident-per-layer N                         experts kept hot per layer (default: 32)
 --moe-prewarm-top-k N                              experts to prewarm at startup (default: 16)
+--moe-residency-debug [on|off]                     periodic mincore() sampling (default: off)
+--moe-residency-debug-interval N                   decodes between mincore() samples (default: 64)
 ```
 
-All available as environment variables: `LLAMA_ARG_MOE_EXPERT_RESIDENCY`, `LLAMA_ARG_MOE_RESIDENT_PER_LAYER`, `LLAMA_ARG_MOE_PREWARM_TOP_K`.
+All available as environment variables: `LLAMA_ARG_MOE_EXPERT_RESIDENCY`, `LLAMA_ARG_MOE_RESIDENT_PER_LAYER`, `LLAMA_ARG_MOE_PREWARM_TOP_K`, `LLAMA_ARG_MOE_RESIDENCY_DEBUG`, `LLAMA_ARG_MOE_RESIDENCY_DEBUG_INTERVAL`.
+
+`--moe-residency-debug` is Linux only. It is intended for development and correctness verification, not production: the `mincore()` call costs O(experts) per sample. Tune `--moe-residency-debug-interval` to balance observability against overhead. The output is logged at `INFO` level and includes both per-expert residency ratios and an aggregate ratio across the cache. To verify the residency policy is doing what it claims, run the model with this flag and compare `policy_hit_rate` (from the per-decode summary) against the `aggregate ... ratio` line. The two should track each other within a few percent on hardware without competing memory pressure.
 
 Requires mmap (`--mmap` is the default). Disabling mmap (`--no-mmap`) also disables residency.
 
@@ -97,7 +121,12 @@ LLAMA_API void     llama_moe_residency_disable(struct llama_context * ctx);
 struct llama_moe_residency_stats {
     uint64_t total_hits;       // expert touches that were already loaded
     uint64_t total_misses;     // expert touches that required MADV_WILLNEED
-    uint64_t total_evicted;    // experts removed from LRU via MADV_DONTNEED
+    uint64_t total_evicted;    // experts removed from LRU via MADV_COLD
+    uint64_t advice_success;   // madvise() calls accepted by the kernel
+    uint64_t advice_failure;   // madvise() calls rejected (any errno)
+    uint64_t advice_einval;    // subset of failures: errno == EINVAL
+    uint64_t invalid_mapping;  // calls skipped (null/len=0/unalignable)
+    bool     uses_madv_cold;   // true on Linux; cold-path advice used
     uint64_t decode_count;     // total decode() calls observed
     uint64_t moe_layer_count;  // number of MoE layers in the model
 };
