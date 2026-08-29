@@ -2200,8 +2200,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             for (int il = 0; il < n_layer_model; ++il) {
                 const auto & stats = expert_stats[il];
                 if (stats.last_selected.empty()) continue;
-                // Deduplicate: a single expert may appear multiple times in
-                // the selection (one per token). touch() is idempotent.
+                // Note: last_selected may contain duplicates (one per
+                // token in a batch). touch_layer_selection does not
+                // dedup - it calls touch() once per entry. The R+F
+                // scoring absorbs duplicate touches naturally
+                // (recency unchanged, access_count increments). The
+                // prior "touch is idempotent" comment was misleading.
                 llama_moe_residency_touch_layer_selection(
                     &moe_residency,
                     il,
