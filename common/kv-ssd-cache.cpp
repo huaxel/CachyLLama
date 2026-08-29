@@ -745,6 +745,20 @@ kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t c
     // Auto-size RAM budgets
     if (c->config.auto_size) {
         size_t avail = common::host_available_ram();
+        // On UMA APUs the loaded model is GTT-mapped in system RAM and
+        // MemAvailable counts those pages as evictable, which leads
+        // auto-size to reserve RAM the model is actively using. Subtract
+        // the model footprint when the caller provided it so the
+        // hot+warm tiers don't compete with the GTT-mapped weights.
+        // Cap the subtraction at (avail / 2) so a misconfigured
+        // oversized model_size_bytes can't drive the budget to zero or
+        // negative.
+        if (c->config.model_size_bytes > 0) {
+            size_t model_sub = c->config.model_size_bytes;
+            size_t cap = avail / 2;
+            if (model_sub > cap) model_sub = cap;
+            if (model_sub < avail) avail -= model_sub;
+        }
         size_t usable = (size_t)((double)avail * (1.0 - c->config.memory_reserve));
         c->config.hot_ram_bytes = (usable * 3) / 4;
         c->config.warm_ram_bytes = usable / 4;
