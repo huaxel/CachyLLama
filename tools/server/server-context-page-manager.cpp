@@ -78,6 +78,7 @@ server_context_page_manager::server_context_page_manager(
         ssd_cfg.auto_size = cfg->auto_size;
         ssd_cfg.max_cold_checkpoints = cfg->max_cold_checkpoints;
         ssd_cfg.memory_reserve = cfg->memory_reserve;
+        ssd_cfg.model_size_bytes = cfg->model_size_bytes;
     }
     if (ssd_cfg.hot_ram_bytes == 0) ssd_cfg.hot_ram_bytes = 2ULL * 1024 * 1024 * 1024;
     if (ssd_cfg.warm_ram_bytes == 0) ssd_cfg.warm_ram_bytes = 1ULL * 1024 * 1024 * 1024;

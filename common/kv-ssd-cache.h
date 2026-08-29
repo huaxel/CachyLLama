@@ -34,6 +34,16 @@ struct kv_ssd_config {
     bool auto_size           = true;
     int max_cold_checkpoints = 32;  // Max checkpoints per model (ring buffer cap)
     float memory_reserve     = 0.15f;
+    // Size of the loaded model in bytes. The auto-size path uses this
+    // to subtract the model's footprint from MemAvailable before
+    // computing hot/warm budgets. On UMA APUs (Ayaneo Flip 7840U,
+    // Strix Halo) the GTT-mapped model lives in the same system RAM
+    // that the SSD cache tiers consume, and MemAvailable counts GTT
+    // pages as evictable. Without this subtraction, auto-size reserves
+    // ~75% of MemAvailable for the hot tier, which combined with a
+    // 20+ GiB GTT-mapped model OOM-kills the server. Set to 0 to
+    // preserve the legacy behavior (auto-size uses raw MemAvailable).
+    size_t model_size_bytes  = 0;
     bool no_fsync            = false; // Skip fsync on write (faster, may lose last checkpoint on crash)
     // v4: model identity fields written to the index header and every
     // per-checkpoint header. Used to reject caches whose underlying
