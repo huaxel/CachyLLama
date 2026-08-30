@@ -1506,9 +1506,18 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     auto result = parser.parse(ctx);
 
     if (result.fail()) {
-        // During partial parsing, return partial results if any AST nodes were captured
-        // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
-        if (is_partial && result.end > 0) {
+        // When parsing fails, try to recover as much as possible rather than
+        // throwing (which kills the session). The recovery order is:
+        //   1. If the parser consumed some input (result.end > 0), extract
+        //      whatever AST nodes were captured before the failure. This
+        //      works for both streaming (is_partial) and final
+        //      (is_partial=false) calls -- a partially matched tool call
+        //      or trailing content is better than terminating the session.
+        //   2. If no content was extracted, fall back to treating the raw
+        //      model output as content text. This ensures the client always
+        //      receives the model's response, even if the format is
+        //      degenerate.
+        if (result.end > 0) {
             // Try to extract any partial results from what was successfully parsed
             common_chat_msg msg;
             msg.role = "assistant";
@@ -1527,15 +1536,28 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
                 sanitize_dsml_content(part.text);
             }
 
+            // Only return the partial extraction if it captured something useful.
+            // Otherwise, fall through to the raw-text fallback below.
+            if (!msg.content.empty() || !msg.tool_calls.empty() || !msg.content_parts.empty() || !msg.reasoning_content.empty()) {
             if (ctx.is_debug()) {
                 fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
                 fflush(stderr);
             }
             return msg;
+            }
         }
         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
-        throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
+        // Raw text fallback: treat the entire model output as content. This
+        // ensures the client receives the response even when the parser
+        // can't match the expected format. Using `input` (not
+        // `effective_input`) excludes the generation_prompt prefix from
+        // continuation turns.
+        common_chat_msg msg;
+        msg.role = "assistant";
+        msg.content = input;
+        sanitize_dsml_content(msg.content);
+        return msg;
     }
 
     common_chat_msg msg;
