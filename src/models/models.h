@@ -2447,8 +2447,12 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
-        // padded top-k width when the gather path applies to this ubatch, otherwise 0
-        int64_t qsa_gather_n_sel(int64_t n_kv, int64_t width) const;
+       // padded top-k width when the gather path applies to this ubatch, otherwise 0
+       int64_t qsa_gather_n_sel(int64_t n_kv, int64_t width) const;
+
+       // cached raw qsa_gather_n_sel result from the last build_qsa_top_k
+       // call, so build_attn_qsa doesn't recompute the env-gated gate
+       int64_t qsa_last_n_sel_ = 0;
 
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set

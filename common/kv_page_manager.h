@@ -95,13 +95,6 @@ struct kv_eviction_config {
     // Cold cache limits
     int max_cold_checkpoints = 0;        // Max cold tier entries (0=unlimited)
 
-    // Size of the loaded model in bytes. The auto-size path subtracts
-    // this from the system RAM budget before allocating hot/warm
-    // tiers, since on UMA APUs the GTT-mapped model lives in the
-    // same RAM that the SSD cache tiers consume. 0 = legacy
-    // behavior (auto-size uses raw MemAvailable).
-    size_t model_size_bytes = 0;
-
     // Flush behavior
     int flush_interval_ms = 30000;       // Flush dirty pages every 30s
     bool write_back = true;              // Use write-back policy

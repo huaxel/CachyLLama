@@ -544,9 +544,14 @@ int llama_moe_residency_debug_sample(
             if (tensors_seen == 0 || exp_pages == 0) continue;
             const double ratio = (double) exp_resident / (double) exp_pages;
             const char * state = "UNKNOWN";
-            // Heuristic: "HOT" if policy is keeping it, "COLD" if it
-            // was evicted, "WARM" otherwise. The exact threshold is
-            // not meaningful - this is for observability.
+            // Policy hint: "HOT" means the R+F policy predicted this
+            // expert would be accessed (access_count > 0); "COLD" means
+            // the policy didn't predict it. This is NOT the same as
+            // physical eviction - the actual residency ratio measured
+            // by mincore() above may still show pages resident even
+            // when state is "COLD" (the kernel may not have reclaimed
+            // them yet). "WARM" is never assigned by this code; the
+            // name is a legacy label from an earlier version.
             if (e.access_count > 0) state = "HOT";
             else                     state = "COLD";
             LLAMA_LOG_INFO(
