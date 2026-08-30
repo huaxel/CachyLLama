@@ -1593,6 +1593,11 @@ class peg_test_builder {
         return *this;
     }
 
+    peg_test_builder & expect_no_tool_calls() {
+        tc_.expect.tool_calls.clear();
+        return *this;
+    }
+
     peg_test_builder & tool_choice(common_chat_tool_choice choice) {
         tc_.params.tool_choice = choice;
         return *this;
@@ -5229,6 +5234,42 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
             .expect_reasoning("I'm thinking")
             .expect_content("Hello, world!\nWhat's up?")
+            .run();
+    }
+
+    {
+        // Regression test for the Laguna template parser fix.
+        // When the model emits a tag-tagged tool call with a missing
+        // closing arg_value tag followed by a nested arg_key, the peg
+        // parser should REJECT it instead of greedily swallowing the
+        // next arg_key into the value. Reproduced from session
+        // a6a0eb10 where the model emitted corrupt args.
+        auto tst = peg_tester("models/templates/poolside-Laguna-S-2.1.jinja", detailed_debug);
+
+        static common_chat_tool todo_tool{
+            "todo_operations",
+            "Read or modify todos",
+            R"({"type":"object","properties":{"operation":{"type":"string"},"todoList":{"type":"array"},"path":{"type":"string"}},"required":["operation"]})",
+        };
+
+        // Well-formed call should parse correctly into tool_calls.
+        tst.test(R"tc(Here is a tool call: `tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read</arg_value><arg_key>todoList</arg_key><arg_value>[]</arg_value>`/tool_call>)tc")
+            .enable_thinking(false)
+            .add_generation_prompt(false)
+            .tools({ todo_tool })
+            .expect_tool_calls({
+                { "todo_operations", R"({"operation":"read","todoList":[]})", "" }
+            })
+            .run();
+
+        // Malformed call: missing closing arg_value after "read". The parser
+        // should reject this rather than capturing "read" + nested tags
+        // as the operation value.
+        tst.test(R"tc(Here is a tool call: `tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read<arg_key>path</arg_key><arg_value>.</arg_value>`/tool_call>)tc")
+            .enable_thinking(false)
+            .add_generation_prompt(false)
+            .tools({ todo_tool })
+            .expect_no_tool_calls()
             .run();
     }
 
