@@ -20,22 +20,6 @@ namespace fs = std::filesystem;
 
 namespace llama {
 
-// FNV-1a 64-bit hash of a byte string. Mirrors kv_ssd_hash_tokens in shape
-// but operates on raw bytes so it works for any string, not just tokens.
-//
-// DEPRECATED for user-isolation lookups: collisions are easy to construct
-// and we are using the result as a security boundary. The user cache
-// map now uses sha256_namespace_key() (see below). This is kept for the
-// in-process conversation hash code path which is not security-relevant.
-static uint64_t fnv1a_string(const std::string & s) {
-    uint64_t h = 14695981039346656037ULL;
-    for (unsigned char c : s) {
-        h ^= (uint64_t)c;
-        h *= 1099511628211ULL;
-    }
-    return h;
-}
-
 // SHA-256-based namespace key for user isolation. The first 8 bytes of
 // the digest are taken as a uint64_t; collisions in the truncated
 // digest are negligibly improbable and the security boundary no longer
@@ -48,15 +32,6 @@ static uint64_t sha256_namespace_key(const std::string & s) {
     return std::stoull(hex.substr(0, 16), nullptr, 16);
 }
 
-// On-disk path uses the first 16 hex chars of the SHA-256 digest
-// (matching the kv_ssd_init conv_hash 16-char formatting). The
-// in-memory key is the same value reinterpreted as uint64_t. This
-// means the on-disk directory is not a copy of the raw user_id, and
-// the in-memory lookup key is the SHA-256 truncation.
-static std::string sha256_dir_token(const std::string & s) {
-    const std::string hex = hash_sha256_hex(s.data(), s.size());
-    return hex.substr(0, 16);
-}
 server_context_page_manager::server_context_page_manager(
     const char* ssd_path,
     const kv_eviction_config* cfg,
@@ -78,7 +53,6 @@ server_context_page_manager::server_context_page_manager(
         ssd_cfg.auto_size = cfg->auto_size;
         ssd_cfg.max_cold_checkpoints = cfg->max_cold_checkpoints;
         ssd_cfg.memory_reserve = cfg->memory_reserve;
-        ssd_cfg.model_size_bytes = cfg->model_size_bytes;
     }
     if (ssd_cfg.hot_ram_bytes == 0) ssd_cfg.hot_ram_bytes = 2ULL * 1024 * 1024 * 1024;
     if (ssd_cfg.warm_ram_bytes == 0) ssd_cfg.warm_ram_bytes = 1ULL * 1024 * 1024 * 1024;
@@ -141,6 +115,7 @@ void server_context_page_manager::set_model_info(const struct llama_model* model
     // expose the content hash from the GGUF v3 metadata block.
     config_.model_identity = h;
     config_.model_hash     = 0;  // not yet wired upstream
+    config_.model_size_bytes = llama_model_size(model);
 
     // Set compat_hash on any already-created cache instances
     for (auto& [conv, wrapper] : conv_wrappers_) {

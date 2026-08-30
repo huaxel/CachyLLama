@@ -153,6 +153,33 @@ static uint64_t fnv1a_bytes(const void * data, size_t count) {
     return h;
 }
 
+// Validate a header checksum on read-back. Returns true if the checksum
+// is absent (zero, meaning the writer didn't set it) or if it matches
+// the recomputed value. Both kv_ssd_index_header and kv_ssd_record
+// carry a uint64_t header_checksum field, so a template covers both.
+template<typename T>
+static bool validate_checksum(const T & hdr, const char * label) {
+    if (hdr.header_checksum == 0) return true;
+    T tmp = hdr;
+    tmp.header_checksum = 0;
+    const uint64_t expected = fnv1a_bytes(&tmp, sizeof(tmp));
+    if (expected != hdr.header_checksum) {
+        LOG_WRN("SSD cache: %s header checksum mismatch "
+                "(stored=0x%016llx computed=0x%016llx) - corrupted\n",
+                label,
+                (unsigned long long) hdr.header_checksum,
+                (unsigned long long) expected);
+        return false;
+    }
+    return true;
+}
+
+// A single (pointer, size) segment for scatter-write I/O.
+struct write_segment {
+    const void * data;
+    size_t size;
+};
+
 // Write `data` (size bytes) atomically to `path`. The implementation:
 //   1. Open {path}.tmp with O_WRONLY | O_CREAT | O_EXCL (no clobber).
 //   2. Write the data.
@@ -169,9 +196,9 @@ static uint64_t fnv1a_bytes(const void * data, size_t count) {
 //
 // Returns true on success, false on any I/O failure (in which case
 // the temp file is removed).
-static bool atomic_write_file(const std::string & path,
-                              const void * data, size_t size,
-                              bool do_fsync = true) {
+static bool atomic_write_segments(const std::string & path,
+                                  const std::vector<write_segment> & segments,
+                                  bool do_fsync = true) {
     namespace fs = std::filesystem;
     const std::string tmp = path + ".tmp";
     // Best-effort cleanup of a stale tmp from a prior crashed write.
@@ -186,13 +213,21 @@ static bool atomic_write_file(const std::string & path,
                 tmp.c_str(), strerror(se), se);
         return false;
     }
-    if (!pwrite_all(fd, data, size, 0)) {
-        int se = errno;
-        LOG_WRN("SSD cache: atomic_write pwrite(%s) failed: %s (errno=%d)\n",
-                tmp.c_str(), strerror(se), se);
-        ::close(fd);
-        ::unlink(tmp.c_str());
-        return false;
+    // Write each segment sequentially at the running offset. This
+    // avoids buffering the entire payload (header + data + specs)
+    // into a single buffer when the caller already has the data
+    // scattered across separate allocations.
+    off_t offset = 0;
+    for (const auto & seg : segments) {
+        if (seg.size > 0 && !pwrite_all(fd, seg.data, seg.size, offset)) {
+            int se = errno;
+            LOG_WRN("SSD cache: atomic_write pwrite(%s) failed: %s (errno=%d)\n",
+                    tmp.c_str(), strerror(se), se);
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return false;
+        }
+        offset += (off_t) seg.size;
     }
     if (do_fsync) {
         ::fsync(fd);
@@ -226,6 +261,16 @@ static bool atomic_write_file(const std::string & path,
         }
     }
     return true;
+}
+
+// Convenience wrapper for the common single-segment case.
+static bool atomic_write_file(const std::string & path,
+                              const void * data, size_t size,
+                              bool do_fsync = true) {
+    if (size > 0) {
+        return atomic_write_segments(path, { {data, size} }, do_fsync);
+    }
+    return atomic_write_segments(path, {}, do_fsync);
 }
 
 // Hint to the kernel that a checkpoint file will be needed soon.
@@ -324,18 +369,7 @@ static bool read_index_file(kv_ssd_cache* c) {
 
     // Validate header checksum. If the writer set it, we require it
     // to match; otherwise (zero) we skip.
-    if (hdr.header_checksum != 0) {
-        kv_ssd_index_header tmp = hdr;
-        tmp.header_checksum = 0;
-        const uint64_t expected = fnv1a_bytes(&tmp, sizeof(tmp));
-        if (expected != hdr.header_checksum) {
-            LOG_WRN("SSD cache: index header checksum mismatch "
-                    "(stored=0x%016llx computed=0x%016llx) - corrupted\n",
-                    (unsigned long long) hdr.header_checksum,
-                    (unsigned long long) expected);
-            return false;
-        }
-    }
+    if (!validate_checksum(hdr, "index")) return false;
 
     c->next_id = hdr.next_id;
     if (c->compat_hash == 0) c->compat_hash = hdr.compat_hash;
@@ -363,19 +397,7 @@ static bool load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
     if (rec.version != KV_SSD_VERSION) return false;
     // Header checksum validation. Skip if the writer didn't set one
     // (zero), require a match if it did.
-    if (rec.header_checksum != 0) {
-        kv_ssd_record tmp = rec;
-        tmp.header_checksum = 0;
-        const uint64_t expected = fnv1a_bytes(&tmp, sizeof(tmp));
-        if (expected != rec.header_checksum) {
-            LOG_WRN("SSD cache: checkpoint %s header checksum mismatch "
-                    "(stored=0x%016llx computed=0x%016llx) - corrupted\n",
-                    filepath.c_str(),
-                    (unsigned long long) rec.header_checksum,
-                    (unsigned long long) expected);
-            return false;
-        }
-    }
+    if (!validate_checksum(rec, filepath.c_str())) return false;
     // Per-checkpoint model identity check. If either the cache config
     // or the checkpoint header carries a non-zero identity and they
     // differ, reject the checkpoint. A legacy v4 record may have
@@ -672,17 +694,7 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
         close(fd);
         return false;
     }
-    if (rec.header_checksum != 0) {
-        kv_ssd_record tmp = rec;
-        tmp.header_checksum = 0;
-        const uint64_t expected = fnv1a_bytes(&tmp, sizeof(tmp));
-        if (expected != rec.header_checksum) {
-            LOG_WRN("SSD cache: checkpoint id=%lu header checksum mismatch - corrupted\n",
-                    (unsigned long) id);
-            close(fd);
-            return false;
-        }
-    }
+    if (!validate_checksum(rec, "checkpoint")) return false;
     if (rec.model_identity != 0 && c->model_identity != 0 &&
         rec.model_identity != c->model_identity) {
         LOG_WRN("SSD cache: checkpoint id=%lu model_identity 0x%016llx "
@@ -894,19 +906,19 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     // then tmp + fsync + rename. Previously this used O_TRUNC + a
     // series of pwrite_all calls, which could leave a half-written
     // file if the process died between any of the writes. See
-    // atomic_write_file().
+    // atomic_write_segments().
     std::string filepath = ckpt_path(cache, id);
-    const size_t total_payload =
-        sizeof(kv_ssd_record) + data_size + rec.dft_data_size + rec.spec_data_size;
-    std::vector<uint8_t> file_buf;
-    file_buf.resize(total_payload);
-    uint8_t * wp = file_buf.data();
-    memcpy(wp, &rec, sizeof(kv_ssd_record)); wp += sizeof(kv_ssd_record);
-    if (data_size > 0) { memcpy(wp, data, data_size); wp += data_size; }
-    if (rec.dft_data_size  > 0) { memcpy(wp, dft_data,  rec.dft_data_size);  wp += rec.dft_data_size;  }
-    if (rec.spec_data_size > 0) { memcpy(wp, spec_data, rec.spec_data_size); wp += rec.spec_data_size; }
-    if (!atomic_write_file(filepath, file_buf.data(), file_buf.size(),
-                          /*do_fsync=*/!cache->config.no_fsync)) {
+    // Write segments directly to the tmp fd instead of buffering
+    // the entire payload (header + data + dft + dft + spec) into a
+    // std::vector<uint8_t>. For large checkpoints this avoids an
+    // extra 10+ MiB allocation + memcpy per store.
+    std::vector<write_segment> segments;
+    segments.push_back({&rec, sizeof(rec)});
+    if (data_size > 0)      segments.push_back({data,      data_size});
+    if (rec.dft_data_size > 0) segments.push_back({dft_data, rec.dft_data_size});
+    if (rec.spec_data_size > 0) segments.push_back({spec_data, rec.spec_data_size});
+    if (!atomic_write_segments(filepath, segments,
+                              /*do_fsync=*/!cache->config.no_fsync)) {
         cache->next_id--;
         return 0;
     }
