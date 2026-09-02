@@ -578,7 +578,8 @@ class DeepseekV4Model(TextModel):
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
         name, gen = item
-        if name.startswith(("aligner.", "image_")):
+        if (name.startswith(("aligner.", "image_"))
+                or name.endswith(".ffn.gate.bias_vl")):
             return None
         if name.startswith("mtp."):
             if not cls.mtp_only:
