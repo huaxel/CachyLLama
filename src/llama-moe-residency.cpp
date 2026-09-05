@@ -143,7 +143,7 @@ bool llama_moe_residency_build(
 
     const auto & hparams = model->hparams;
     const int n_expert = hparams.n_expert;
-    const int n_expert_used = hparams.n_expert_used;
+    const int n_expert_used = hparams.n_expert_used();
     const int n_layer = hparams.n_layer();
     if (n_expert <= 0 || n_expert_used <= 0) {
         return false;

@@ -893,7 +893,7 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
 
     const int64_t n_layer = model.hparams.n_layer();
     const int64_t n_expert = model.hparams.n_expert;
-    const int64_t n_expert_used = model.hparams.n_expert_used;
+    const int64_t n_expert_used = model.hparams.n_expert_used();
     if (n_expert <= 0) return;  // Not an MoE model
 
     // First pass: try to use ffn_moe_topk (I32 top-K view) or
@@ -2239,7 +2239,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 const auto & stats = expert_stats[il];
                 if (stats.last_selected.empty()) continue;
                 // First token's selections: [0, n_expert_used) entries.
-                const int n_used = model.hparams.n_expert_used;
+                const int n_used = model.hparams.n_expert_used();
                 llama_moe_coact::record(
                     moe_coact, il, stats.last_selected.data(), n_used);
                 // Cross-layer with previous decode (token 0 only).
@@ -4796,7 +4796,7 @@ int32_t llama_expert_stats_get(const struct llama_context * ctx, int32_t layer, 
     if (!layer_stats) return -1;
 
     stats->n_expert = (int32_t)layer_stats->activation_count.size();
-    stats->n_expert_used = model.hparams.n_expert_used;
+    stats->n_expert_used = model.hparams.n_expert_used();
     stats->total_tokens = layer_stats->total_tokens;
     stats->activation_count = const_cast<uint64_t*>(layer_stats->activation_count.data());
 
@@ -4822,7 +4822,7 @@ int32_t llama_expert_last_selected_get(
     const auto * stats = ctx->get_expert_stats(layer);
     if (!stats) return -1;
 
-    selection->n_expert_used = model.hparams.n_expert_used;
+    selection->n_expert_used = model.hparams.n_expert_used();
     selection->n_tokens      = stats->n_tokens_last;
     selection->selected      = stats->last_selected.empty()
                                 ? nullptr
