@@ -1399,6 +1399,22 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer_all, false);
 
+    // CachyLLama: MTP draft context still allocates KV cache tensors for il >= n_layer()
+    // (e.g. qwen35moe mtp_on_hybrid_qwen path uses `filter = il >= n_layer()`), and those
+    // tensors look up n_head_kv_arr[il] / n_ff_arr[il] in their ggml_new_tensor calls.
+    // Upstream #28159 changed the get_key_or_arr size from n_layer_all to n_layer(),
+    // leaving the MTP layer positions at 0, which causes ggml to attempt a 0-dim tensor
+    // allocation and abort with "failed to allocate buffer for kv cache". Copy the last
+    // trunk layer's values into the MTP layer positions so the per-layer tensors allocate.
+    if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0) {
+        const uint32_t src = hparams.n_layer() - 1;
+        for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+            hparams.n_ff_arr[il]      = hparams.n_ff_arr[src];
+            hparams.n_head_arr[il]    = hparams.n_head_arr[src];
+            hparams.n_head_kv_arr[il] = hparams.n_head_kv_arr[src];
+        }
+    }
+
     bool rope_finetuned = false;
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
     hparams.rope_finetuned = rope_finetuned;
