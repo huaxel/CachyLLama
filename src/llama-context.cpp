@@ -4935,6 +4935,7 @@ void llama_moe_residency_stats_get(
 #else
     out->uses_madv_cold   = false;
 #endif
+    out->madvise_disabled_due_to_pressure = ctx->moe_residency.madvise_disabled_due_to_pressure;
 }
 
 //
