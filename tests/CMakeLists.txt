@@ -296,6 +296,8 @@ llama_build_and_test(test-ssd-cache-prefix-match.cpp)
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
 llama_build_and_test(test-kv-ssd-user-isolation.cpp)
+# Pure unit test for the in-memory ring buffer checkpoint acceptance
+llama_build_and_test(test-checkpoint-predicate.cpp)
 # Test-only wrappers in src/llama-moe-residency.h are declared LLAMA_API,
 # so this test links against libllama directly and runs on all platforms
 # including Windows+shared. Exercises the platform-agnostic madvise shim
