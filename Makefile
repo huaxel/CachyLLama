@@ -9,7 +9,6 @@
 #   cli            Build llama-cli only
 #   bench          Build llama-bench only
 #   quantize       Build llama-quantize only
-#   perplexity     Build llama-perplexity only
 #   release        Full Release build with optimizations
 #   debug          Debug build
 #   clean          Remove build directory
@@ -64,7 +63,7 @@ YELLOW := \033[33;1m
 CYAN := \033[36;1m
 NC := \033[0m
 
-.PHONY: all sync sync-merge server cli bench quantize perplexity release debug clean rebuild deploy restart test info
+.PHONY: all sync sync-merge server cli bench quantize release debug clean rebuild deploy restart test info
 
 # --- Opt-in deploy (guarded by ENABLE_DEPLOY=1) ---
 #
@@ -129,11 +128,6 @@ quantize:
 	@$(CMAKE) --build $(BUILD_DIR) --target llama-quantize --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-quantize$(NC)\n"
 
-perplexity:
-	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-perplexity --config $(BUILD_TYPE) -j $(PARALLEL)
-	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-perplexity$(NC)\n"
-
 release:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
 	@$(CMAKE) --build $(BUILD_DIR) --config $(BUILD_TYPE) -j $(PARALLEL)
@@ -175,7 +169,7 @@ restart:
 
 debug:
 	@$(CMAKE) -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_BACKEND_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --config Debug -j $(PARALLEL)
 
 # --- Housekeeping ---
 
@@ -193,8 +187,9 @@ clean:
 rebuild: clean release
 
 test:
-	@$(MAKE) release
-	@cd $(BUILD_DIR) && ctest --output-on-failure -j $(PARALLEL)
+	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS) -DLLAMA_BUILD_TESTS=ON
+	@$(CMAKE) --build $(BUILD_DIR) --config $(BUILD_TYPE) -j $(PARALLEL)
+	@cd $(BUILD_DIR) && ctest -C $(BUILD_TYPE) --output-on-failure -j $(PARALLEL)
 
 # --- Info ---
 
@@ -234,7 +229,6 @@ info:
 	@printf "  make cli          llama-cli only\n"
 	@printf "  make bench        llama-bench only\n"
 	@printf "  make quantize     llama-quantize only\n"
-	@printf "  make perplexity   llama-perplexity only\n"
 	@printf "  make release      Release build\n"
 	@printf "  make debug        Debug build\n"
 	@printf "  make clean        Remove build directory\n"
