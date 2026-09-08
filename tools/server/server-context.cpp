@@ -3278,28 +3278,6 @@ private:
             return;
         }
 
-        int n_sys = kv_detect_system_prompt_boundary(
-            llama_model_get_vocab(llama_get_model(ctx_tgt)),
-            tokens.data(),
-            (int32_t)tokens.size(),
-            params_base.chat_template.empty() ? nullptr : params_base.chat_template.c_str());
-
-        if (n_sys <= 0 || n_sys >= (int32_t)tokens.size()) {
-            slot_sys_hash[slot.id] = 1;  // mark as checked, nothing to do
-            return;
-        }
-
-        // MIN_USEFUL_SYS_TOKENS: don't cache trivial system sections
-        // (chat template header with no actual system message). The
-        // per-conversation SSD cache handles these cases. This also
-        // prevents false-positive boundary detection from filling
-        // the system cache with near-empty entries.
-        const int32_t MIN_USEFUL_SYS_TOKENS = 16;
-        if (n_sys < MIN_USEFUL_SYS_TOKENS) {
-            slot_sys_hash[slot.id] = 1;
-            return;
-        }
-
         // The state must have been captured immediately after the system
         // prompt. This hook normally runs after the full prompt, so refuse
         // to store unless the sequence position proves the boundary.
@@ -4743,18 +4721,6 @@ private:
                                                         (uint32_t)n_sys, sys_data)) {
                                         recovered_n_sys = n_sys;
                                         recovered = true;
-                                    } else if ((uint32_t)n_sys >= MIN_PREFIX_MATCH &&
-                                               sys_cache->load_prefix((const uint32_t*)task_tokens.data(),
-                                                       (uint32_t)n_sys, MIN_PREFIX_MATCH, sys_data)) {
-                                        // Prefix fallback matched: the entry agrees on its first
-                                        // MIN_PREFIX_MATCH tokens, and the divergent tail is
-                                        // accepted as approximate. Only reached for non-recurrent
-                                        // memories now - a recurrent state is one tensor folded
-                                        // over every token, so "approximate" does not apply to it.
-                                        recovered_n_sys = n_sys;
-                                        recovered = true;
-                                        SLT_DBG(slot, "[PROBE] sys-cache-fallback prefix-match recovered at n_sys=%d (exact match failed)\n",
-                                                n_sys);
                                     }
                                 }
 
