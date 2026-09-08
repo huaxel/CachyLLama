@@ -6577,6 +6577,16 @@ struct test_topk_moe : public test_case {
     // Verify two outputs
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (strcmp(ggml_backend_reg_name(reg), "Vulkan") == 0) {
+            // The fused shader computes the delayed softmax with subgroup arithmetic;
+            // its operation order differs slightly from the scalar CPU reference.
+            return 5e-4;
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
     // allow output in arbitrary order
     double err(const float * a, const float * b, size_t n) override {
         std::vector<float> a2(n);
