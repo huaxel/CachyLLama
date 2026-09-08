@@ -4857,10 +4857,11 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         };
 
         // Well-formed call should parse correctly into tool_calls.
-        tst.test(R"tc(Here is a tool call: `tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read</arg_value><arg_key>todoList</arg_key><arg_value>[]</arg_value>`/tool_call>)tc")
+        tst.test(R"tc(Here is a tool call: <tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read</arg_value><arg_key>todoList</arg_key><arg_value>[]</arg_value></tool_call>)tc")
             .enable_thinking(false)
             .add_generation_prompt(false)
             .tools({ todo_tool })
+            .expect_content("Here is a tool call: ")
             .expect_tool_calls({
                 { "todo_operations", R"({"operation":"read","todoList":[]})", "" }
             })
@@ -4869,10 +4870,11 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         // Malformed call: missing closing arg_value after "read". The parser
         // should reject this rather than capturing "read" + nested tags
         // as the operation value.
-        tst.test(R"tc(Here is a tool call: `tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read<arg_key>path</arg_key><arg_value>.</arg_value>`/tool_call>)tc")
+        tst.test(R"tc(Here is a tool call: <tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read<arg_key>path</arg_key><arg_value>.</arg_value></tool_call>)tc")
             .enable_thinking(false)
             .add_generation_prompt(false)
             .tools({ todo_tool })
+            .expect_content("Here is a tool call: <tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read<arg_key>path</arg_key><arg_value>.</arg_value></tool_call>")
             .expect_no_tool_calls()
             .run();
     }
