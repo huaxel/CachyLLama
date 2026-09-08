@@ -2,14 +2,13 @@
 # This wraps CMake for convenience. Full build system is CMake — see docs/build.md.
 #
 # Targets:
-#   sync           Fetch upstream + rebase onto upstream/master + push + build (default)
-#   sync-merge     Fetch upstream + merge into master + push + build (legacy)
+#   sync           Fetch upstream + rebase onto upstream/master + build + push
+#   sync-merge     Fetch upstream + merge into master + build + push (legacy)
 #   all            Build everything (default)
 #   server         Build llama-server only
 #   cli            Build llama-cli only
 #   bench          Build llama-bench only
 #   quantize       Build llama-quantize only
-#   perplexity     Build llama-perplexity only
 #   release        Full Release build with optimizations
 #   debug          Debug build
 #   clean          Remove build directory
@@ -64,7 +63,7 @@ YELLOW := \033[33;1m
 CYAN := \033[36;1m
 NC := \033[0m
 
-.PHONY: all sync sync-merge server cli bench quantize perplexity release debug clean rebuild deploy restart test info
+.PHONY: all sync sync-merge server cli bench quantize release debug clean rebuild deploy restart test info
 
 # --- Opt-in deploy (guarded by ENABLE_DEPLOY=1) ---
 #
@@ -78,6 +77,9 @@ NC := \033[0m
 # --- Sync with upstream ---
 
 sync-merge:
+	@if test -n "$$(git status --porcelain)"; then \
+		echo "Refusing to sync with a dirty working tree" >&2; exit 1; \
+	fi
 	@printf "$(BLUE)⟳ Fetching $(UPSTREAM)...$(NC)\n"
 	git fetch $(UPSTREAM)
 	@printf "$(BLUE)⟳ Merging $(UPSTREAM)/$(BRANCH) into $(BRANCH)...$(NC)\n"
@@ -88,6 +90,9 @@ sync-merge:
 	@printf "$(GREEN)✓ $(BRANCH) synced with upstream$(NC)\n"
 
 sync:
+	@if test -n "$$(git status --porcelain)"; then \
+		echo "Refusing to sync with a dirty working tree" >&2; exit 1; \
+	fi
 	@printf "$(BLUE)⟳ Fetching $(UPSTREAM)...$(NC)\n"
 	git fetch $(UPSTREAM)
 	@printf "$(BLUE)⟳ Rebasing $(BRANCH) onto $(UPSTREAM)/$(BRANCH)...$(NC)\n"
@@ -105,32 +110,27 @@ all: release
 
 server:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-server -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --target llama-server --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-server$(NC)\n"
 
 cli:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-cli -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --target llama-cli --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-cli$(NC)\n"
 
 bench:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-bench -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --target llama-bench --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-bench$(NC)\n"
 
 quantize:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-quantize -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --target llama-quantize --config $(BUILD_TYPE) -j $(PARALLEL)
 	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-quantize$(NC)\n"
-
-perplexity:
-	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --target llama-perplexity -j $(PARALLEL)
-	@printf "$(GREEN)✓ $(BUILD_DIR)/bin/llama-perplexity$(NC)\n"
 
 release:
 	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) --config Release -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --config $(BUILD_TYPE) -j $(PARALLEL)
 	@if [ "$(ENABLE_DEPLOY)" = "1" ]; then $(MAKE) deploy; fi
 
 deploy:
@@ -169,7 +169,7 @@ restart:
 
 debug:
 	@$(CMAKE) -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_BACKEND_FLAGS)
-	@$(CMAKE) --build $(BUILD_DIR) -j $(PARALLEL)
+	@$(CMAKE) --build $(BUILD_DIR) --config Debug -j $(PARALLEL)
 
 # --- Housekeeping ---
 
@@ -187,8 +187,9 @@ clean:
 rebuild: clean release
 
 test:
-	@$(MAKE) release
-	@cd $(BUILD_DIR) && ctest --output-on-failure -j $(PARALLEL)
+	@$(CMAKE) -B $(BUILD_DIR) $(CMAKE_FLAGS) -DLLAMA_BUILD_TESTS=ON
+	@$(CMAKE) --build $(BUILD_DIR) --config $(BUILD_TYPE) -j $(PARALLEL)
+	@cd $(BUILD_DIR) && ctest -C $(BUILD_TYPE) --output-on-failure -j $(PARALLEL)
 
 # --- Info ---
 
@@ -228,7 +229,6 @@ info:
 	@printf "  make cli          llama-cli only\n"
 	@printf "  make bench        llama-bench only\n"
 	@printf "  make quantize     llama-quantize only\n"
-	@printf "  make perplexity   llama-perplexity only\n"
 	@printf "  make release      Release build\n"
 	@printf "  make debug        Debug build\n"
 	@printf "  make clean        Remove build directory\n"
