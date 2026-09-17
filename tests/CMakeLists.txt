@@ -262,6 +262,23 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # Cold-tier cap must also be enforced when checkpoints demote to cold
+    # during on_turn_complete, not only after checkpoint stores
+    llama_build(test-ssd-manager-cold-cap.cpp)
+    target_include_directories(test-ssd-manager-cold-cap PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/tools/server
+    )
+    target_link_libraries(test-ssd-manager-cold-cap PRIVATE server-context)
+    llama_test(
+        test-ssd-manager-cold-cap
+        LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf"
+    )
+    set_tests_properties(test-ssd-manager-cold-cap PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     llama_build(test-fusion.cpp)
 endif()
 
