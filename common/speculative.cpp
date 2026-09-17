@@ -1056,15 +1056,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // turn on extraction of the target layers' input embeddings
         const uint32_t n_layer_tgt = (uint32_t) llama_model_n_layer(model_tgt);
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            if (target_layer_ids[k] < n_layer_tgt) {
-                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
-            } else if (target_layer_ids[k] == n_layer_tgt) {
+            const int32_t target_layer_id = target_layer_ids[k];
+            if (target_layer_id >= 0 && (uint32_t) target_layer_id < n_layer_tgt) {
+                llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_id, true);
+            } else if (target_layer_id == (int32_t) n_layer_tgt) {
                 // Last target layer's input == post-final-layer hidden state, exposed
                 // as the "nextn" buffer (same convention EAGLE3 uses).
                 llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
             } else {
                 GGML_ABORT("DFlash: target layer id %d exceeds target n_layer %d",
-                        target_layer_ids[k], n_layer_tgt);
+                        target_layer_id, n_layer_tgt);
             }
         }
 
@@ -1167,11 +1168,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     // target_layer_ids may include n_layer_tgt (the post-final-layer
                     // hidden state), which lives in the embeddings_nextn buffer.
-                    const float * layer = target_layer_ids[k] < n_layer_tgt_l
-                        ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
-                        : llama_get_embeddings_nextn(ctx_tgt);
+                    const int32_t target_layer_id = target_layer_ids[k];
+                    const float * layer = target_layer_id >= 0 && (uint32_t) target_layer_id < n_layer_tgt_l
+                        ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_id)
+                        : target_layer_id == (int32_t) n_layer_tgt_l
+                        ? llama_get_embeddings_nextn(ctx_tgt)
+                        : nullptr;
                     if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_id);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
