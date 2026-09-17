@@ -83,7 +83,8 @@ jobs:
           cmake -B build \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DGGML_RPC=ON \
-            -DGGML_VXE=${{ matrix.vxe }}
+            -DGGML_VXE=${{ matrix.vxe }} \
+            -DLLAMA_BUILD_EXTRA_TOOLS=ON
           time cmake --build build --config Release -j $(nproc)
 
       - name: Test
@@ -135,7 +136,9 @@ jobs:
         run: |
           cmake -B build \
             -DLLAMA_FATAL_WARNINGS=ON \
-            -DGGML_RPC=ON
+            -DGGML_RPC=ON \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_EXTRA_TOOLS=ON
           time cmake --build build --config Release -j $(nproc)
 
       - name: Test

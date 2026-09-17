@@ -105,7 +105,9 @@ jobs:
           cmake -B build \
             -DGGML_NATIVE=OFF \
             -DLLAMA_FATAL_WARNINGS=ON \
-            -DGGML_RPC=ON
+            -DGGML_RPC=ON \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_EXTRA_TOOLS=ON
           time cmake --build build --config Release -j $(nproc)
 
       - name: ccache-buckets-save

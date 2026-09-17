@@ -31,6 +31,13 @@ else()
     add_subdirectory(tokenize)
     add_subdirectory(tts)
     add_subdirectory(mtmd)
+    # Extra tools invoked by CI (ci/run.sh, llama2c workflow tests). Not part
+    # of the lean server-focused default build; enable with LLAMA_BUILD_EXTRA_TOOLS=ON.
+    if (LLAMA_BUILD_EXTRA_TOOLS)
+        add_subdirectory(completion)
+        add_subdirectory(perplexity)
+        add_subdirectory(fit-params)
+    endif()
     if (GGML_RPC)
         add_subdirectory(rpc)
     endif()
