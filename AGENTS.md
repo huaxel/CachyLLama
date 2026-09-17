@@ -21,7 +21,7 @@
 
 | Subsystem | Location | Description |
 |-----------|----------|-------------|
-| Persistent SSD-backed KV cache | `common/kv-ssd-cache.cpp`, `common/kv-ssd-system-cache.cpp`, `common/kv_page_manager.cpp` | Three-tier (hot/warm/cold) on-disk KV cache with conversation hashing |
+| Persistent SSD-backed KV cache | `common/kv-ssd-cache.cpp`, `common/kv-ssd-system-cache.cpp`, `tools/server/server-context-ssd-manager.cpp` | Three-tier (hot/warm/cold) on-disk KV cache with conversation hashing |
 | MoE expert residency | `src/llama-moe-residency.cpp` | madvise-based expert paging for models larger than RAM |
 | MoE expert co-activation tracking | `src/llama-moe-coact.cpp` | Persists expert co-activation matrix for prewarm ordering |
 | MoE expert activation tracking | C API in `include/llama.h` | Real-time per-layer expert activation counts via `/expert-stats` |
@@ -75,7 +75,7 @@ cmake --build build --config Release -j$(nproc)
     |                        src/llama-moe-residency.cpp
    common/                   src/llama-moe-coact.cpp
    (utilities)               common/kv-ssd-*.cpp
-   common/host-ram.{h,cpp}   common/kv_page_manager.cpp
+   common/host-ram.{h,cpp}   tools/server/server-context-ssd-manager.cpp
    common/arg.cpp            common/kv-ssd-system-cache.cpp
    common/sampling.cpp       common/preset.cpp
                              common/reasoning-budget.cpp
@@ -101,7 +101,7 @@ cmake --build build --config Release -j$(nproc)
 | `src/models/*.cpp` | Per-model architecture implementations (130+ models) |
 | `common/kv-ssd-cache.cpp` | Persistent SSD-backed KV cache |
 | `common/kv-ssd-system-cache.cpp` | Cross-conversation system prompt cache |
-| `common/kv_page_manager.cpp` | Page-level cache management |
+| `tools/server/server-context-ssd-manager.{h,cpp}` | Server integration of the SSD cache (tiering, caps, conversation/user routing) |
 | `common/host-ram.{h,cpp}` | Cross-platform available-RAM query |
 | `common/arg.cpp` | CLI argument parsing (includes CachyLLama flags) |
 | `common/sampling.cpp` | Token sampling strategies |
@@ -120,7 +120,6 @@ cmake --build build --config Release -j$(nproc)
 | `common/` | Shared utilities (arg parsing, sampling, chat, Jinja, PEG parser) |
 | `common/kv-ssd-cache.cpp` | SSD-backed KV cache |
 | `common/kv-ssd-system-cache.cpp` | System prompt cache |
-| `common/kv_page_manager.cpp` | Page management |
 | `common/host-ram.{h,cpp}` | Host RAM query |
 | `ggml/` | ggml tensor library (submodule: backends, quantization, graph execution) |
 | `tools/` | Executable tools (server, CLI, bench, quantize, perplexity) |
@@ -275,6 +274,10 @@ models: add Laguna-S-2.1 support (decoder_arch = "laguna")
 # Server
 ./build/bin/llama-server -m model.gguf
 
+# Extra tools (completion, perplexity, fit-params) needed by CI and
+# quality workflows; not part of the lean default build
+# cmake -B build -DLLAMA_BUILD_EXTRA_TOOLS=ON
+
 # CLI
 ./build/bin/llama-cli -m model.gguf
 
@@ -333,7 +336,7 @@ Run the model with `--moe-residency-debug` (Linux only). The per-decode log line
 
 ### Verifying SSD cache is doing what it claims
 
-Check that the `kv-ssd` on-disk directory uses the expected `conv_hash` or SHA-256 `user_id` prefix (not a raw `user_id`). For atomic-write guarantees, kill the server with `kill -9` mid-checkpoint-write and verify that the prior valid index is recoverable on next startup. The `tests/test-kv-ssd-user-isolation` binary exercises both properties without needing a real model.
+Check that the `kv-ssd` on-disk directory uses the expected `conv_hash` or SHA-256 `user_id` prefix (not a raw `user_id`). In router mode each worker's root is `<--cache-ssd path>/<model name>` (namespaced at spawn, `5fe16a2ec`) — two models never share conversation directories. For atomic-write guarantees, kill the server with `kill -9` mid-checkpoint-write and verify that the prior valid index is recoverable on next startup. The `tests/test-kv-ssd-user-isolation` binary exercises both properties without needing a real model.
 
 ### Independently disabling optimizations
 
@@ -475,7 +478,7 @@ The deleted `fewtarius/CachyLLama` remote is preserved as `legacy-upstream`. The
 | `66f8f76fb` | Remove dead `kv_page_manager`, consolidate SSD cache, add MoE tests, TTL host-RAM | Dead code removal, new tests, TTL feature — upstream hasn't reviewed. | ✅ Smaller codebase, MoE regression coverage. |
 | `116660728` | Rename `ssd_page_manager` → `ssd_cache_manager`, fix AGENTS.md Strix Halo status | Cosmetic rename matching class rename; upstream hasn't reviewed. | ✅ Baked into binary. |
 | `2cac39964` | SSD hardening: exact-match-only restore, `seq_pos_max` guard, v4 format, multimodal/safety guards, atomic deploy | Hardening built on fork-only SSD code. Includes `host-ram` bugfix, `kv-ssd-posix` mutex, new `test-ssd-system-cache`. | ✅ 97+ SSD checkpoints active; exact-match-only prevents corrupt state restores. |
-| `b6b882749` | `deploy`/`restart`/`clean` Makefile hardening | CachyLLama-specific deployment; atomic swap + rollback. | ⚠️ Not yet exercised. `/opt/cachy-llama/bin` was last written 2026-07-22, before this target existed; the recipe staged `$(BUILD_DIR)/.` instead of `$(BUILD_DIR)/bin/.` and would have aborted on its own `test -x`. Fixed, but still unrun against prod. |
+| `b6b882749` | `deploy`/`restart`/`clean` Makefile hardening | CachyLLama-specific deployment; atomic swap + rollback. | ⚠️ Staging/swap file logic sandbox-verified (staging `$(BUILD_DIR)/bin/.`, exec checks, backup swap, rollback all pass); only the systemd-coupled steps (`sudo systemctl stop/restart llama.cpp`) remain unexercised against prod. `/opt/cachy-llama/bin` was last written 2026-07-22, before this target existed; the original recipe staged `$(BUILD_DIR)/.` instead of `$(BUILD_DIR)/bin/.` and would have aborted on its own `test -x`. |
 | `d56cb4583` | `make sync` routine | Minor Makefile refactor; not submitted upstream. | ✅ Used for rebase workflow. |
 | `9c7698b22` | Drop duplicate `common_get_model_or_exit` / `SRV_TRC` left by rebase auto-merge | Rebase artifact cleanup; not submitted upstream. | ✅ Built and tested. |
 
