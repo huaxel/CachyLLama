@@ -2,7 +2,9 @@
 #include "http.h"
 #include "server-http.h"
 #include "server-common.h"
+#ifdef LLAMA_BUILD_UI
 #include "ui.h"
+#endif
 
 #include <cpp-httplib/httplib.h>
 
@@ -185,6 +187,7 @@ bool server_http_context::init(const common_params & params) {
     //
 
     // Frontend paths - all embedded UI assets
+#ifdef LLAMA_BUILD_UI
     static const std::unordered_set<std::string> frontend_paths = []() {
         std::unordered_set<std::string> paths { "/" };
         for (const llama_ui_asset & a : llama_ui_get_assets()) {
@@ -192,6 +195,9 @@ bool server_http_context::init(const common_params & params) {
         }
         return paths;
     }();
+#else
+    static const std::unordered_set<std::string> frontend_paths;
+#endif
 
     // Public endpoints - API routes plus all embedded UI assets
     static const std::unordered_set<std::string> get_public_endpoints = []() {

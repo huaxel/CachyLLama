@@ -2844,6 +2844,10 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
 }
 
+int32_t llama_model_n_expert_used(const llama_model * model) {
+    return model->hparams.n_expert_used();
+}
+
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }
@@ -3204,6 +3208,11 @@ llama_token llama_model_decoder_start_token(const llama_model * model) {
 
 bool llama_model_is_recurrent(const llama_model * model) {
     return llm_arch_is_recurrent(model->arch);
+}
+
+
+bool llama_model_is_mla(const llama_model * model) {
+    return model->hparams.is_mla();
 }
 
 bool llama_model_is_hybrid(const llama_model * model) {

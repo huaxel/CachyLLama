@@ -642,6 +642,11 @@ function gg_check_build_requirements {
         echo 'unzip not found, please install'
         exit 1
     fi
+
+    if ! command -v unzip &> /dev/null; then
+        gg_printf 'unzip not found, please install\n'
+        exit 1
+    fi
 }
 
 function gg_run_test_backend_ops {

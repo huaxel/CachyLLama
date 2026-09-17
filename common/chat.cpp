@@ -25,6 +25,7 @@
 #include <map>
 
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1434,10 +1435,402 @@ common_chat_msg common_chat_parse(const std::string &               input,
     return common_chat_peg_parse(params.parser, input, is_partial, params);
 }
 
+// Best-effort JSON repair: try parsing, then fix trailing commas and
+// truncated JSON (missing closing braces/brackets). Returns the repaired
+// JSON string if fixes were needed and successful, or the original string
+// if it was already valid. If no valid JSON could be produced, returns
+// the raw input string (better than losing the tool call entirely).
+static std::string repair_json_args(const std::string & json_str, bool truncated) {
+    // Try parsing as-is
+    auto parsed = common_json::parse_no_throw(json_str);
+    if (!parsed.is_discarded()) {
+        if (parsed.is_object() || parsed.is_array()) {
+            return parsed.dump();   // canonical form
+        }
+        return json_str;            // scalar JSON like "celsius" or 42
+    }
+
+    std::string repaired = json_str;
+
+    if (truncated) {
+        // Add missing closing braces/brackets, tracking depth
+        int  close_depth = 1;
+        bool in_string   = false;
+        bool escape      = false;
+        for (size_t i = 0; i < repaired.size(); i++) {
+            char c = repaired[i];
+            if (escape)   { escape = false; continue; }
+            if (c == '\\') { escape = true; continue; }
+            if (c == '"')  { in_string = !in_string; continue; }
+            if (in_string) continue;
+            if (c == '{' || c == '[') close_depth++;
+            if (c == '}' || c == ']') close_depth--;
+        }
+        while (close_depth > 0) {
+            repaired += '}';
+            close_depth--;
+        }
+    }
+
+    // Remove trailing commas before } or ]
+    static const std::regex trailing_comma_re(R"(\,\s*([}\]]))");
+    repaired = std::regex_replace(repaired, trailing_comma_re, "$1");
+
+    auto repaired_parsed = common_json::parse_no_throw(repaired);
+    if (!repaired_parsed.is_discarded()) {
+        if (repaired_parsed.is_object() || repaired_parsed.is_array()) {
+            return repaired_parsed.dump();
+        }
+        return repaired;
+    }
+
+    // Could not repair - return raw string
+    return json_str;
+}
+
+// Find the matching closing brace for an opening brace at `start`, handling
+// nested braces, arrays, and string literals. Returns npos if unmatched
+// (truncated JSON).
+static size_t find_json_end(const std::string & s, size_t start) {
+    int  brace_depth = 1;
+    bool in_string   = false;
+    bool escape      = false;
+    for (size_t i = start + 1; i < s.size(); i++) {
+        char c = s[i];
+        if (escape) { escape = false; continue; }
+        if (c == '\\') { escape = true; continue; }
+        if (c == '"')  { in_string = !in_string; continue; }
+        if (in_string) continue;
+        if (c == '{' || c == '[') brace_depth++;
+        if (c == '}' || c == ']') brace_depth--;
+        if (brace_depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+// Salvage content, reasoning, and tool calls from raw peg-native output
+// when the PEG parser fails to fully match. This handles cases where the
+// model produces valid tool-call blocks with malformed JSON arguments,
+// unclosed thinking tags, or other structural issues that cause the
+// parser to reject the entire output.
+//
+// Three tool-call formats are supported:
+//   1. [TOOL_CALLS]func_name[ARGS]{json}  (DeepSeek V3, Qwen2.5)
+//   2. <function=func>\n<parameter=name>\njson_value\n</parameter>\n...  (Qwen3-Coder)
+//   3. <function name="func"><param name="name">json_value</param>...  (Qwen2.5-Coder XML)
+//
+// JSON arguments are parsed with a best-effort repair strategy for common
+// model output issues (trailing commas, truncated JSON).
+static common_chat_msg salvage_peg_native_output(const std::string &             input,
+                                                 const common_chat_parser_params & params) {
+    common_chat_msg msg;
+    msg.role = "assistant";
+
+    if (params.format != COMMON_CHAT_FORMAT_PEG_NATIVE || !params.parse_tool_calls) {
+        msg.content = input;
+        return msg;
+    }
+
+    bool has_thinking = params.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+
+    // Determine which tool-call format is in use by probing the input.
+    bool has_bracket_tc    = input.find("[TOOL_CALLS]") != std::string::npos;
+    bool has_xml_equals    = input.find("<function=")  != std::string::npos;
+    bool has_xml_quoted    = input.find("<function name=") != std::string::npos;
+
+    if (!has_bracket_tc && !has_xml_equals && !has_xml_quoted) {
+        // No recognizable tool-call format - fall back to raw text
+        msg.content = input;
+        return msg;
+    }
+
+    // --- Extract thinking blocks (if applicable) ---
+    // Handle [THINK]...[/THINK] tags (DeepSeek V3 / Ministral format)
+    if (has_thinking) {
+        size_t think_start = input.find("[THINK]");
+        if (think_start != std::string::npos) {
+            size_t think_end = input.find("[/THINK]", think_start);
+            if (think_end != std::string::npos) {
+                msg.reasoning_content = input.substr(think_start + 7, think_end - think_start - 7);
+            } else {
+                msg.reasoning_content = input.substr(think_start + 7);
+            }
+        }
+    }
+
+    // --- Strip thinking blocks from content and find content boundary ---
+    std::string content_cleaned = input;
+    if (has_thinking && !msg.reasoning_content.empty()) {
+        // Remove the thinking block from the content
+        size_t think_start = content_cleaned.find("[THINK]");
+        if (think_start != std::string::npos) {
+            size_t think_end = content_cleaned.find("[/THINK]", think_start);
+            if (think_end != std::string::npos) {
+                content_cleaned = content_cleaned.substr(0, think_start) + content_cleaned.substr(think_end + 8);
+            } else {
+                content_cleaned = content_cleaned.substr(0, think_start);
+            }
+        }
+    }
+
+    // --- Extract tool calls ---
+
+    if (has_bracket_tc) {
+        // Format 1: [TOOL_CALLS]func_name[ARGS]{json_args}
+        size_t pos = 0;
+        while (true) {
+            size_t tc_pos = content_cleaned.find("[TOOL_CALLS]", pos);
+            if (tc_pos == std::string::npos) break;
+            pos = tc_pos + 12;  // skip "[TOOL_CALLS]"
+
+            size_t args_marker_pos = content_cleaned.find("[ARGS]", pos);
+            if (args_marker_pos == std::string::npos) break;
+
+            // Function name: text between "[TOOL_CALLS]" and "[ARGS]"
+            std::string func_name = content_cleaned.substr(pos, args_marker_pos - pos);
+            // Trim whitespace
+            if (!func_name.empty()) {
+                size_t s = func_name.find_first_not_of(" \t\n\r");
+                size_t e = func_name.find_last_not_of(" \t\n\r");
+                func_name = (s != std::string::npos) ? func_name.substr(s, e - s + 1) : std::string();
+            }
+
+            common_chat_tool_call tc;
+            tc.name = func_name;
+
+            // Find JSON: starts with '{' after "[ARGS]"
+            size_t json_start = content_cleaned.find('{', args_marker_pos + 7);
+            if (json_start == std::string::npos) {
+                tc.arguments = "{}";
+                msg.tool_calls.push_back(tc);
+                pos = args_marker_pos + 7;
+                continue;
+            }
+
+            size_t json_end = find_json_end(content_cleaned, json_start);
+            bool json_complete = (json_end != std::string::npos);
+
+            std::string json_str = json_complete
+                ? content_cleaned.substr(json_start, json_end - json_start + 1)
+                : content_cleaned.substr(json_start);
+
+            tc.arguments = repair_json_args(json_str, !json_complete);
+            msg.tool_calls.push_back(tc);
+
+            pos = json_complete ? json_end + 1 : content_cleaned.size();
+        }
+
+        // Set content: text before the first [TOOL_CALLS]
+        if (has_bracket_tc) {
+            size_t first_tc = content_cleaned.find("[TOOL_CALLS]");
+            msg.content = content_cleaned.substr(0, first_tc);
+        }
+
+    } else if (has_xml_quoted) {
+        // Format 3: <function name="func_name"><param name="p1">v1</param><param name="p2">v2</param></function>
+        size_t pos = 0;
+        while (true) {
+            size_t fn_open = content_cleaned.find("<function name=\"", pos);
+            if (fn_open == std::string::npos) break;
+            size_t fn_name_start = fn_open + 17;
+            size_t fn_name_end   = content_cleaned.find('"', fn_name_start);
+            if (fn_name_end == std::string::npos) break;
+
+            size_t fn_close = content_cleaned.find("</function>", fn_name_end);
+            if (fn_close == std::string::npos) {
+                // Truncated - take rest of input
+                fn_close = content_cleaned.size();
+            }
+
+            std::string func_name = content_cleaned.substr(fn_name_start, fn_name_end - fn_name_start);
+            std::string block     = content_cleaned.substr(fn_name_end + 1, fn_close - fn_name_end - 1);
+
+            // Extract parameters: <param name="name">value</param>
+            common_json args = common_json::object();
+            size_t param_pos = 0;
+            while (true) {
+                size_t param_open = block.find("<param name=\"", param_pos);
+                if (param_open == std::string::npos) break;
+                size_t name_start = param_open + 13;
+                size_t name_end   = block.find('"', name_start);
+                if (name_end == std::string::npos) break;
+
+                size_t value_start = name_end + 2; // skip ">"
+                size_t value_end   = block.find("</param>", value_start);
+                if (value_end == std::string::npos) {
+                    value_end = block.size();
+                }
+
+                std::string param_name = block.substr(name_start, name_end - name_start);
+                std::string param_value = block.substr(value_start, value_end - value_start);
+
+                // Try parsing value as JSON; if not valid, wrap as string
+                auto val_parsed = common_json::parse_no_throw(param_value);
+                if (!val_parsed.is_discarded()) {
+                    args[param_name] = val_parsed;
+                } else {
+                    args[param_name] = param_value;
+                }
+
+                param_pos = value_end + 8; // skip "</param>"
+                if (fn_close == content_cleaned.size()) break; // truncated
+            }
+
+            common_chat_tool_call tc;
+            tc.name      = func_name;
+            tc.arguments = args.dump();
+            msg.tool_calls.push_back(tc);
+
+            pos = fn_close + 11; // skip "</function>"
+            if (fn_close == content_cleaned.size()) break; // truncated, no </function>
+        }
+
+        // Content: text before the first <function
+        size_t first_fn = content_cleaned.find("<function name=\"");
+        if (first_fn == std::string::npos) {
+            first_fn = content_cleaned.find("<function=");
+        }
+        if (first_fn != std::string::npos) {
+            msg.content = content_cleaned.substr(0, first_fn);
+        }
+
+    } else if (has_xml_equals) {
+        // Format 2: <function=func_name>\n<parameter=name>\njson_value\n</parameter>\n...\n</function>
+        size_t pos = 0;
+        while (true) {
+            size_t fn_open = content_cleaned.find("<function=", pos);
+            if (fn_open == std::string::npos) break;
+            pos = fn_open + 11; // skip "<function="
+
+            size_t fn_close = content_cleaned.find(">", pos);
+            if (fn_close == std::string::npos) break;
+
+            std::string func_name = content_cleaned.substr(pos, fn_close - pos);
+            // Trim whitespace
+            if (!func_name.empty()) {
+                size_t s = func_name.find_first_not_of(" \t\n\r");
+                size_t e = func_name.find_last_not_of(" \t\n\r");
+                func_name = (s != std::string::npos) ? func_name.substr(s, e - s + 1) : std::string();
+            }
+
+            // Find matching </function>
+            size_t fn_end = content_cleaned.find("</function>", fn_close);
+            std::string block = fn_end != std::string::npos
+                ? content_cleaned.substr(fn_close + 1, fn_end - fn_close - 1)
+                : content_cleaned.substr(fn_close + 1);
+
+            // Extract parameters: <parameter=name>\njson_value\n</parameter>
+            common_json args = common_json::object();
+            size_t param_pos = 0;
+            while (true) {
+                size_t param_open = block.find("<parameter=", param_pos);
+                if (param_open == std::string::npos) break;
+                param_pos = param_open + 11; // skip "<parameter="
+
+                size_t param_name_end = block.find(">", param_pos);
+                if (param_name_end == std::string::npos) break;
+
+                std::string param_name = block.substr(param_pos, param_name_end - param_pos);
+                // Trim whitespace from name
+                if (!param_name.empty()) {
+                    size_t s = param_name.find_first_not_of(" \t\n\r");
+                    size_t e = param_name.find_last_not_of(" \t\n\r");
+                    param_name = (s != std::string::npos) ? param_name.substr(s, e - s + 1) : std::string();
+                }
+
+                size_t value_start = param_name_end + 1;
+                size_t value_end   = block.find("</parameter>", value_start);
+                if (value_end == std::string::npos) {
+                    value_end = block.size();
+                }
+
+                std::string param_value = block.substr(value_start, value_end - value_start);
+                // Trim whitespace
+                if (!param_value.empty()) {
+                    size_t s = param_value.find_first_not_of(" \t\n\r");
+                    size_t e = param_value.find_last_not_of(" \t\n\r");
+                    param_value = (s != std::string::npos) ? param_value.substr(s, e - s + 1) : std::string();
+                }
+
+                // Try parsing value as JSON; if not valid, use raw string
+                auto val_parsed = common_json::parse_no_throw(param_value);
+                if (!val_parsed.is_discarded()) {
+                    args[param_name] = val_parsed;
+                } else {
+                    args[param_name] = param_value;
+                }
+
+                param_pos = value_end + 12; // skip "</parameter>"
+                if (value_end == block.size()) break; // truncated
+            }
+
+            common_chat_tool_call tc;
+            tc.name      = func_name;
+            tc.arguments = args.dump();
+            msg.tool_calls.push_back(tc);
+
+            if (fn_end == std::string::npos) {
+                break; // truncated, no </function>
+            }
+            pos = fn_end + 11; // skip "</function>"
+        }
+
+        // Content: text before the first <function=
+        size_t first_fn = content_cleaned.find("<function=");
+        if (first_fn != std::string::npos) {
+            msg.content = content_cleaned.substr(0, first_fn);
+        }
+
+        // Trim trailing whitespace from content
+        if (!msg.content.empty()) {
+            size_t e = msg.content.find_last_not_of(" \t\n\r");
+            if (e != std::string::npos) {
+                msg.content = msg.content.substr(0, e + 1);
+            }
+        }
+    }
+
+    return msg;
+}
+
 common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_parser,
                                       const std::string &               input,
                                       bool                              is_partial,
                                       const common_chat_parser_params & params) {
+    // Strip malformed DSML tool-call markers from assistant content. DeepSeek
+    // V3.2/V4 use DSML (<|DSML|tool_calls>, <|DSML|invoke>, <|DSML|parameter>,
+    // etc.) only inside tool-call blocks; any DSML tag that survives in
+    // msg.content means the model emitted malformed tokens (typically when
+    // stuck in a degenerate tool-call-marker loop, upstream issue #26694:
+    // "DeepSeek-V4-Flash degenerates into repetition and leaks special tokens
+    // in long agentic chats"). The PEG parser correctly refuses to match
+    // these as tool calls, so they fall through to msg.content and clients
+    // render unprintable DSML. Strip every malformed token (open OR close,
+    // well-formed AND unclosed/orphaned) so downstream clients never see
+    // raw DSML. Tool calls in msg.tool_calls are unaffected.
+    // U+FF5C (FULLWIDTH VERTICAL LINE), UTF-8 = EF BD 9C
+    //
+    // Two passes:
+    //   1. Well-formed tags: <[/]?|DSML|XXX>  (single greedy match per
+    //      unclosed/opening/closing/faux-pair token because [^>]* swallows
+    //      everything up to the next `>`, including embedded body and
+    //      adjacent opener/closer fragments when the model lost track of
+    //      the syntax entirely).
+    //   2. Unclosed tokens: <[/]?|DSML|XXX terminated by EOF, newline, or
+    //      the next tag's `<` (covers <|DSML|tool_operations\n and
+    //      </|DSML|parameter with no closing `>` left in the response, the
+    //      pattern observed in the user's reported log).
+    static const std::regex malformed_dsml_re(
+        "<[/]?" "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c" "[^>]*>",
+        std::regex::optimize);
+    static const std::regex unclosed_dsml_re(
+        "<[/]?" "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c" "[^<>]*?(?:$|<|\n)",
+        std::regex::optimize);
+    auto sanitize_dsml_content = [](std::string & s) {
+        s = std::regex_replace(std::move(s), malformed_dsml_re, "");
+        s = std::regex_replace(std::move(s), unclosed_dsml_re,    "");
+    };
+
     const common_peg_arena & parser = src_parser.empty() ?
         build_chat_peg_parser([](common_chat_peg_builder & p) { return p.content(p.rest()) + p.end(); }) :
         src_parser;
@@ -1461,9 +1854,18 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     auto result = parser.parse(ctx);
 
     if (result.fail()) {
-        // During partial parsing, return partial results if any AST nodes were captured
-        // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
-        if (is_partial && result.end > 0) {
+        // When parsing fails, try to recover as much as possible rather than
+        // throwing (which kills the session). The recovery order is:
+        //   1. If the parser consumed some input (result.end > 0), extract
+        //      whatever AST nodes were captured before the failure. This
+        //      works for both streaming (is_partial) and final
+        //      (is_partial=false) calls -- a partially matched tool call
+        //      or trailing content is better than terminating the session.
+        //   2. If no content was extracted, fall back to treating the raw
+        //      model output as content text. This ensures the client always
+        //      receives the model's response, even if the format is
+        //      degenerate.
+        if (result.end > 0) {
             // Try to extract any partial results from what was successfully parsed
             common_chat_msg msg;
             msg.role = "assistant";
@@ -1477,15 +1879,33 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             }
             mapper->from_ast(ctx.ast, result);
 
+            sanitize_dsml_content(msg.content);
+            for (auto & part : msg.content_parts) {
+                sanitize_dsml_content(part.text);
+            }
+
+            // Only return the partial extraction if it captured something useful.
+            // Otherwise, fall through to the raw-text fallback below.
+            if (!msg.content.empty() || !msg.tool_calls.empty() || !msg.content_parts.empty() || !msg.reasoning_content.empty()) {
             if (ctx.is_debug()) {
                 fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
                 fflush(stderr);
             }
             return msg;
+            }
         }
         LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), effective_input.substr(result.end).c_str());
         LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", __func__, common_chat_format_name(params.format), effective_input.c_str());
-        throw std::runtime_error(std::string("The model produced output that does not match the expected ") + common_chat_format_name(params.format) + " format");
+        // Raw text fallback: try to salvage tool calls and thinking content
+        // from the raw output before giving up. This ensures the client
+        // always receives the model's response -- including structured
+        // tool calls -- even when the PEG parser can't fully match.
+        common_chat_msg msg = salvage_peg_native_output(input, params);
+        sanitize_dsml_content(msg.content);
+        for (auto & part : msg.content_parts) {
+            sanitize_dsml_content(part.text);
+        }
+        return msg;
     }
 
     common_chat_msg msg;
@@ -1500,6 +1920,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         mapper = std::make_unique<common_chat_peg_mapper>(msg);
     }
     mapper->from_ast(ctx.ast, result);
+
+    sanitize_dsml_content(msg.content);
+    for (auto & part : msg.content_parts) {
+        sanitize_dsml_content(part.text);
+    }
 
     if (ctx.is_debug()) {
         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());

@@ -4149,6 +4149,97 @@ int op_matmul_nx(struct htp_ops_context * octx) {
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
     const uint32_t n_weights = kparams->n_weights;
+    const struct htp_tensor * restrict src0 = octx->src[0];
+    const struct htp_tensor * restrict act  = octx->src[n_weights];
+    const struct htp_tensor * restrict ids  = octx->src[n_weights + 1];
+
+    struct htp_mm_context mmctx_struct = {0};
+    struct htp_mm_context * mmctx = &mmctx_struct;
+    mmctx->octx = octx;
+    mmctx->act = act;
+
+    const size_t src0_row_size = src0->nb[1];
+    const size_t src0_row_size_padded = hex_round_up(src0_row_size, 128);
+
+    const uint32_t src0_nrows = src0->ne[1];
+    const uint32_t src1_nrows = act->ne[1] * act->ne[2] * act->ne[3];
+
+    mmctx->src0_nrows_per_thread = fastdiv(src0_nrows + octx->n_threads - 1, &octx->ctx->n_threads_div);
+    mmctx->src0_nrows_per_thread = hex_round_up(mmctx->src0_nrows_per_thread, 32);
+
+    const int n_ids = ids->ne[0];
+    const int n_as  = src0->ne[2];
+
+    uint8_t  * mapping_buf       = octx->ctx->ddr_spad_base;
+    uint32_t   mapping_stride    = 1;
+    uint32_t * matrix_row_counts = (uint32_t *) mapping_buf;
+    struct mmid_row_mapping * matrix_rows = NULL;
+
+    if (src1_nrows > 1) {
+        const size_t matrix_row_counts_size = n_as * sizeof(uint32_t);
+        assert(octx->ctx->ddr_spad_size >= matrix_row_counts_size);
+
+        hex_l2fetch_block((const void *) ids->data, ids->ne[1] * ids->nb[1]);
+
+        memset(matrix_row_counts, 0, matrix_row_counts_size);
+        scan_expert_ids(ids, n_ids, n_as, matrix_row_counts, NULL, 0);
+
+        uint32_t max_count = hvx_reduce_max_i32((const uint8_t *) matrix_row_counts, n_as);
+        mapping_stride = max_count > 0 ? max_count : 1;
+
+        size_t matrix_row_map_size  = n_as * mapping_stride * sizeof(struct mmid_row_mapping);
+        const size_t total_map_size = matrix_row_counts_size + matrix_row_map_size;
+
+        if (total_map_size > octx->ctx->ddr_spad_size) {
+            mapping_buf = memalign(128, total_map_size);
+            if (!mapping_buf) {
+                return HTP_STATUS_INTERNAL_ERR;
+            }
+        }
+
+        matrix_row_counts = (uint32_t *) mapping_buf;
+        matrix_rows       = (struct mmid_row_mapping *) (mapping_buf + matrix_row_counts_size);
+
+        memset(matrix_row_counts, 0, n_as * sizeof(uint32_t));
+        scan_expert_ids(ids, n_ids, n_as, matrix_row_counts, matrix_rows, mapping_stride);
+    }
+
+    mmctx->matrix_row_counts    = matrix_row_counts;
+    mmctx->matrix_rows          = matrix_rows;
+    mmctx->mapping_stride       = mapping_stride;
+    mmctx->mm_div_ne11          = kparams->div_ne11;
+    mmctx->src0_row_size_padded = src0_row_size_padded;
+    mmctx->src1_nrows           = src1_nrows;
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
+
+    int s;
+    if (kparams->n_hmx) {
+        s = hmx_mm_op_matmul_id_nx(octx, mmctx);
+    } else {
+        if (hvx_mm_init_vec_dot(mmctx, src0->type) == 0) {
+            s = hvx_mm_matmul_id_nx(octx, mmctx, src1_nrows > 1 ? hvx_mm_id_nx : hvx_mv_id_nx);
+        } else {
+            s = HTP_STATUS_NO_SUPPORT;
+        }
+    }
+
+    if (mapping_buf != octx->ctx->ddr_spad_base) {
+        free(mapping_buf);
+    }
+
+    return s;
+}
+int op_matmul_nx(struct htp_ops_context * octx) {
+    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+    if (kparams->n_hmx) {
+        return hmx_mm_nx_2d_f32(octx, kparams);
+    }
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[0];
+    htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
+
+    const uint32_t n_weights = kparams->n_weights;
 
     const struct htp_tensor * restrict src0 = octx->src[0]; // first weight
     const struct htp_tensor * restrict act  = octx->src[n_weights]; // activation x

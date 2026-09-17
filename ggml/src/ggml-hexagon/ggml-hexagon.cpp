@@ -3114,6 +3114,8 @@ struct ggml_hexagon_opqueue {
         uint8_t * t_ptr = m_ptr; m_ptr += t_size;
         uint8_t * o_ptr = m_ptr;
 
+        op_batch->sort_buffers();
+
         memcpy(b_ptr, (void *) op_batch->h_bufs.data(), b_size);
         memcpy(t_ptr, (void *) op_batch->h_tens.data(), t_size);
         memcpy(o_ptr, (void *) op_batch->h_ops.data(),  o_size);
@@ -3969,6 +3971,8 @@ ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & co
         release();
         throw;
     }
+
+    GGML_UNUSED(dev);
 }
 
 ggml_hexagon_session::~ggml_hexagon_session() noexcept(true) {

@@ -823,8 +823,13 @@ void process_shaders() {
             string_to_spv("dequant_" + tname, "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}}));
         }
         // Fused dequant+transpose variant for FA quant-KV (per-head-contiguous f16 scratch).
-        if (tname == "q8_0") {
+        // All four are bit-exact equal to the native FA f16 path once dequant-once is engaged.
+        if (tname == "q8_0" || tname == "q4_0" || tname == "q4_1" || tname == "q5_0" || tname == "q5_1") {
             string_to_spv("dequant_" + tname + "_transpose", "dequant_" + tname + ".comp", merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float16_t"}, {"DEQUANT_TRANSPOSE", "1"}}));
+        }
+        // Strided-copy counterpart for f16 KV (contiguize the head-interleaved cache layout).
+        if (tname == "f16") {
+            string_to_spv("dequant_f16_transpose", "dequant_f16_transpose.comp", {});
         }
 
         shader = (tname == "f32" || tname == "f16" || tname == "bf16") ? "get_rows.comp" : "get_rows_quant.comp";
@@ -949,6 +954,9 @@ void process_shaders() {
     string_to_spv("concat_i8", "concat.comp", {{"A_TYPE", "uint8_t"}, {"B_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
     string_to_spv("concat_i16", "concat.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("concat_i32", "concat.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
+    // dim-0 concat with transposed src1 (delta-net path). 32x32 shared-memory tile transpose,
+    // same push-constant ABI as concat.comp / copy_transpose_02.comp.
+    string_to_spv("concat_transpose_i32", "concat_transpose.comp", {{"A_TYPE", "uint"}, {"B_TYPE", "uint"}, {"D_TYPE", "uint"}});
     string_to_spv("concat_i64", "concat.comp", {{"A_TYPE", "uvec2"}, {"B_TYPE", "uvec2"}, {"D_TYPE", "uvec2"}});
 
     string_to_spv("upscale_f32", "upscale.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
@@ -1133,11 +1141,9 @@ void process_shaders() {
 
     string_to_spv("gated_linear_attn_f32", "gla.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 
-    // Compile IQ4_NL support in so its shared LUT is available when K uses it.
-    // K quant type is selected at runtime via the FaTypeK spec constant.
-    std::map<std::string, std::string> li_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}};
-    string_to_spv("lightning_indexer_f32", "lightning_indexer.comp", li_dict);
-    string_to_spv("lightning_indexer_subgroup_f32", "lightning_indexer.comp", merge_maps(li_dict, {{"USE_SUBGROUP_ADD", "1"}}));
+    // CachyLLama: lightning_indexer_f32 registered above with CachyLLama's spec constants
+    // (N_EMBD, N_HEAD_MAX, K_VECS_PER_WARP). Upstream cb300598d adds a type-dictionary
+    // variant (li_dict) but CachyLLama's shader is self-contained.
 
     string_to_spv("rwkv_wkv7_f32", "wkv7.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
 

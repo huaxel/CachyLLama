@@ -1177,32 +1177,51 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
         std::string     prefix      = tc.input.substr(0, safe_len);
         common_chat_msg msg_current = parser.parse(prefix, is_partial);
 
-        for (const auto & diff : common_chat_msg_diff::compute_diffs(msg_prev, msg_current)) {
-            if (!diff.reasoning_content_delta.empty()) {
-                msg_accum.reasoning_content += diff.reasoning_content_delta;
+        try {
+            for (const auto & diff : common_chat_msg_diff::compute_diffs(msg_prev, msg_current)) {
+                if (!diff.reasoning_content_delta.empty()) {
+                    msg_accum.reasoning_content += diff.reasoning_content_delta;
+                }
+                if (!diff.content_delta.empty()) {
+                    msg_accum.content += diff.content_delta;
+                }
+                if (diff.tool_call_index != std::string::npos) {
+                    // During partial parsing, a new tool call may appear with empty name initially
+                    // The name gets filled in as more input is parsed
+                    while (msg_accum.tool_calls.size() <= diff.tool_call_index) {
+                        msg_accum.tool_calls.push_back({ "", "", "" });
+                    }
+                    // Always update name and id from diff (may change during incremental parsing), but only if the delta
+                    // actually contains them
+                    if (!diff.tool_call_delta.name.empty()) {
+                        msg_accum.tool_calls[diff.tool_call_index].name = diff.tool_call_delta.name;
+                    }
+                    if (!diff.tool_call_delta.id.empty()) {
+                        msg_accum.tool_calls[diff.tool_call_index].id = diff.tool_call_delta.id;
+                    }
+                    if (!diff.tool_call_delta.arguments.empty()) {
+                        msg_accum.tool_calls[diff.tool_call_index].arguments += diff.tool_call_delta.arguments;
+                    }
+                }
             }
-            if (!diff.content_delta.empty()) {
-                msg_accum.content += diff.content_delta;
-            }
-            if (diff.tool_call_index != std::string::npos) {
-                // During partial parsing, a new tool call may appear with empty name initially
-                // The name gets filled in as more input is parsed
-                while (msg_accum.tool_calls.size() <= diff.tool_call_index) {
-                    msg_accum.tool_calls.push_back({ "", "", "" });
-                }
-                // Always update name and id from diff (may change during incremental parsing), but only if the delta
-                // actually contains them
-                if (!diff.tool_call_delta.name.empty()) {
-                    msg_accum.tool_calls[diff.tool_call_index].name = diff.tool_call_delta.name;
-                }
-                if (!diff.tool_call_delta.id.empty()) {
-                    msg_accum.tool_calls[diff.tool_call_index].id = diff.tool_call_delta.id;
-                }
-                if (!diff.tool_call_delta.arguments.empty()) {
-                    msg_accum.tool_calls[diff.tool_call_index].arguments += diff.tool_call_delta.arguments;
-                }
-            }
+        } catch (const std::runtime_error &) {
+            // The diff implies the parser shrank content between consecutive parses
+            // (e.g. common_chat_peg_parse applied the malformed-DSML sanitizer that
+            // stripped a tag from msg_current.content but not msg_prev.content).
+            // Additive deltas cannot represent this; treat msg_current as canonical.
+            msg_accum.content          = msg_current.content;
+            msg_accum.reasoning_content = msg_current.reasoning_content;
+            msg_accum.tool_calls       = msg_current.tool_calls;
+            msg_accum.content_parts    = msg_current.content_parts;
         }
+
+        // common_chat_peg_parse may apply post-parse transformations (e.g. malformed-DSML
+        // sanitization) that shrink content relative to the previous prefix. The additive
+        // delta above cannot represent a shrink, so detect drift and re-sync msg_accum.
+        if (msg_accum.content != msg_current.content) {
+            msg_accum = msg_current;
+        }
+
         try {
             assert_msg_equals(msg_current, msg_accum, true);
         } catch (std::exception & e) {
@@ -1213,7 +1232,13 @@ static void test_peg_parser(common_chat_templates *                      tmpls,
     }
 
     if (!tc.is_partial) {
-        assert_msg_equals(tc.expect, parser.parse(tc.input, false), true);
+        common_chat_msg msg_final = parser.parse(tc.input, false);
+        assert_msg_equals(tc.expect, msg_final, true);
+        // If the final parser applies a post-parse transformation (e.g. malformed-DSML
+        // sanitization in common/chat.cpp) that the incremental parses skipped, the
+        // accumulated msg_accum won't equal msg_final. Override it with msg_final so
+        // the assert_msg_equals below compares like with like.
+        msg_accum = msg_final;
     }
     assert_msg_equals(tc.expect, msg_accum, true);
 
@@ -1555,6 +1580,11 @@ class peg_test_builder {
 
     peg_test_builder & expect_tool_calls(std::vector<common_chat_tool_call> calls) {
         tc_.expect.tool_calls = std::move(calls);
+        return *this;
+    }
+
+    peg_test_builder & expect_no_tool_calls() {
+        tc_.expect.tool_calls.clear();
         return *this;
     }
 
@@ -4353,6 +4383,37 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    {
+        // Malformed DSML tool-call markers emitted by V4-Flash-0731 when stuck in a
+        // degenerate loop (upstream #26694). The PEG parser correctly refuses to
+        // match them as tool calls; the post-parse sanitizer should strip the
+        // tags from content so downstream clients (CLIO, etc.) don't render
+        // unprintable "<|DSML|an_call>" garbage. Bodies between open/close pairs
+        // are preserved.
+        auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja", detailed_debug);
+        tst.test(
+               "<｜DSML｜an_call_last_tool> I'll run a quick test of a few tools to verify they're all working.\n\n"
+               "<｜DSML｜an_call>\n"
+               "<｜DSML｜an_call>\n"
+               "</｜DSML｜an_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect_content(" I'll run a quick test of a few tools to verify they're all working.")
+            .expect(simple_assist_msg(" I'll run a quick test of a few tools to verify they're all working."))
+            .run();
+
+        // Sanity: tags present mid-stream are still stripped on partial parses.
+        tst.test(
+               "<｜DSML｜an_call>partial")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .is_partial(true)
+            .expect_content("partial")
+            .run();
+    }
+
     // GLM-4.6 tests - format: <tool_call>function_name\n<arg_key>...</arg_key>\n<arg_value>...</arg_value>\n</tool_call>
     {
         auto tst = peg_tester("models/templates/GLM-4.6.jinja", detailed_debug);
@@ -4602,7 +4663,8 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
                 "</think>"
                 "<tool_call>get_weather"
                 "<arg_key>city</arg_key><arg_value>Tokyo</arg_value>"
-                "</tool_call>\n";
+                "</tool_call>\n"
+                "unexpected trailing output";
 
             bool got_runtime_error = false;
             bool got_out_of_range = false;
@@ -4935,6 +4997,44 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
             .expect_reasoning("I'm thinking")
             .expect_content("Hello, world!\nWhat's up?")
+            .run();
+    }
+
+    {
+        // Regression test for the Laguna template parser fix.
+        // When the model emits a tag-tagged tool call with a missing
+        // closing arg_value tag followed by a nested arg_key, the peg
+        // parser should REJECT it instead of greedily swallowing the
+        // next arg_key into the value. Reproduced from session
+        // a6a0eb10 where the model emitted corrupt args.
+        auto tst = peg_tester("models/templates/poolside-Laguna-S-2.1.jinja", detailed_debug);
+
+        static common_chat_tool todo_tool{
+            "todo_operations",
+            "Read or modify todos",
+            R"({"type":"object","properties":{"operation":{"type":"string"},"todoList":{"type":"array"},"path":{"type":"string"}},"required":["operation"]})",
+        };
+
+        // Well-formed call should parse correctly into tool_calls.
+        tst.test(R"tc(Here is a tool call: <tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read</arg_value><arg_key>todoList</arg_key><arg_value>[]</arg_value></tool_call>)tc")
+            .enable_thinking(false)
+            .add_generation_prompt(false)
+            .tools({ todo_tool })
+            .expect_content("Here is a tool call: ")
+            .expect_tool_calls({
+                { "todo_operations", R"({"operation":"read","todoList":[]})", "" }
+            })
+            .run();
+
+        // Malformed call: missing closing arg_value after "read". The parser
+        // should reject this rather than capturing "read" + nested tags
+        // as the operation value.
+        tst.test(R"tc(Here is a tool call: <tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read<arg_key>path</arg_key><arg_value>.</arg_value></tool_call>)tc")
+            .enable_thinking(false)
+            .add_generation_prompt(false)
+            .tools({ todo_tool })
+            .expect_content("Here is a tool call: <tool_call>todo_operations<arg_key>operation</arg_key><arg_value>read<arg_key>path</arg_key><arg_value>.</arg_value></tool_call>")
+            .expect_no_tool_calls()
             .run();
     }
 

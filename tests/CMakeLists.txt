@@ -217,6 +217,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
 
     llama_test(
+        test-seq-rm-attn-only
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-seq-rm-attn-only PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
         test-recurrent-state-rollback
         NAME test-recurrent-state-rollback-nemotron-h
         LABEL main
@@ -295,9 +304,35 @@ set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download
 
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
-
+# Regression test for fewtarius/llama-ai issue #6:
+# SSD cache auto-sizing must respect --cache-ssd-hot-ram / --cache-ssd-warm-ram.
+llama_build_and_test(test-ssd-cache-caps.cpp)
+llama_build_and_test(test-ssd-system-cache.cpp)
+llama_build_and_test(test-ssd-cache-format.cpp)
+# Continuation matching must consider long (n_tokens > ~4551) checkpoints,
+# not just the bounded 4096-token prefix. Normalize overlap by token_count.
+llama_build_and_test(test-ssd-cache-continuation.cpp)
+llama_build_and_test(test-ssd-cache-prefix-match.cpp)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-moe-residency.cpp)
+    target_include_directories(test-moe-residency PRIVATE ${CMAKE_SOURCE_DIR}/src)
+endif()
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)
+llama_build_and_test(test-kv-ssd-user-isolation.cpp)
+# Pure unit test for the in-memory ring buffer checkpoint acceptance
+llama_build_and_test(test-checkpoint-predicate.cpp)
+# Test-only wrappers in src/llama-moe-residency.h are declared LLAMA_API,
+# so this test links against libllama directly and runs on all platforms
+# including Windows+shared. Exercises the platform-agnostic madvise shim
+# (real madvise on Linux, PrefetchVirtualMemory/VirtualUnlock on Windows).
+llama_build_and_test(test-madvise-shim.cpp)
+target_include_directories(test-madvise-shim PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # disabled on Windows because it uses internal functions not exported with LLAMA_API (when building with shared libraries)
+    llama_build_and_test(test-moe-residency-routing.cpp)
+    target_include_directories(test-moe-residency-routing PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
@@ -308,6 +343,14 @@ endif()
 
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
+
+# the tensor API kernels come from a separate metallib - check they produce correct results
+# ref: https://github.com/ggml-org/llama.cpp/issues/27473
+if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
+    llama_test(test-backend-ops NAME test-backend-ops-metallib-tensor
+               ARGS test -b MTL0 -o MUL_MAT -p type_a=q6_K)
+    set_tests_properties(test-backend-ops-metallib-tensor PROPERTIES ENVIRONMENT GGML_METAL_TENSOR_ENABLE=1)
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

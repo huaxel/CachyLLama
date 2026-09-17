@@ -166,11 +166,20 @@ jobs:
           export GGML_VK_DISABLE_COOPMAT=1
           ctest -L main --verbose --timeout 900
 
-  windows:
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-linux-x64-vulkan.zip
+          name: llama-bin-linux-x64-vulkan.zip
+
+  windows-x64:
     runs-on: windows-2025
 
     env:
-      VULKAN_VERSION: 1.4.357.0
+      VULKAN_VERSION: 1.4.313.2
+
+    permissions:
+      actions: write
 
     steps:
       - name: Clone
@@ -180,7 +189,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: cpu-windows-2025-x64-vulkan
+          key: vulkan-windows-2025-x64-llvm
           variant: ccache
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
@@ -219,12 +228,73 @@ jobs:
           cd build
           ctest -L main -C Release --verbose --timeout 900
 
-      - name: ccache-clear
-        uses: ./.github/actions/ccache-clear
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-llvm-vulkan-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
         with:
-          key: cpu-windows-2025-x64-vulkan
-          older: 5m
-          min: 1
-          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+          path: llama-bin-win-llvm-vulkan-x64.zip
+          name: llama-bin-win-llvm-vulkan-x64.zip
+
+  windows-msvc-x64:
+    runs-on: windows-2025
+
+    env:
+      VULKAN_VERSION: 1.4.313.2
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: msvc-windows-2025-x64-vulkan
+          variant: ccache
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Install Vulkan SDK
+        id: get_vulkan
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DGGML_RPC=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_VULKAN=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
+
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          ctest -L main -C Release --verbose --timeout 900
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-msvc-vulkan-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-msvc-vulkan-x64.zip
+          name: llama-bin-win-msvc-vulkan-x64.zip

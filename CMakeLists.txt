@@ -131,11 +131,11 @@ option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE
 # extra artifacts
 option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS     "llama: build tools"                                                                ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                                                             ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                                                             OFF)
 option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
-option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   OFF)
 option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       OFF)
-option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available" ON)
+option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" ON)
 
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
@@ -254,9 +254,18 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
-if (LLAMA_BUILD_APP)
-    add_subdirectory(app)
-endif()
+# app/ (unified llama binary) is intentionally not built by default in the
+# server-focused CachyLLama configuration. The `app/` subdirectory contains
+# an alternate `llama` executable that bundles the server, CLI, downloader,
+# bench, quantize, and perplexity tools into a single binary with subcommands
+# (`llama serve`, `llama cli`, `llama download`, etc.), following the
+# upstream `llama-install.sh` distribution model. It depends on the
+# per-tool `-impl` shared libraries produced by `tools/`, which require
+# `LLAMA_BUILD_TOOLS=ON`. To enable, add `LLAMA_BUILD_TOOLS=ON` and
+# `add_subdirectory(app)` to this file, or build via the parent
+# llama-ai project's `scripts/rebuild.sh` which wires both. CachyLLama
+# does not ship a unified binary as its default distribution shape; the
+# per-tool binaries in `build/bin/` are the supported entry points.
 
 # Standalone libmtmd build without pulling in the rest of the tools/ tree.
 # Useful when packaging just the mtmd library for language bindings (e.g. an

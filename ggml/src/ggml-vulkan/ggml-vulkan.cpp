@@ -49,6 +49,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -581,6 +582,15 @@ enum FaCodePath {
     FA_COOPMAT2,
 };
 
+// Bytes per buffer block for the FaBlockBytesK/V spec constants. F32 is fed as
+// a vec4 "block" of 4 floats, everything else uses its ggml block size.
+static uint32_t fa_block_bytes(ggml_type t) {
+    if (t == GGML_TYPE_F32) {
+        return 16u;
+    }
+    return (uint32_t) ggml_type_size(t);
+}
+
 struct vk_fa_pipeline_state {
     uint32_t HSK, HSV;
     uint32_t Br, Bc;
@@ -651,7 +661,7 @@ enum shader_reduction_mode {
 // argsort pipelines for up to 1<<10 invocations per workgroup
 static constexpr uint32_t num_argsort_pipelines = 11;
 static constexpr uint32_t num_topk_moe_pipelines = 10;
-static constexpr uint32_t num_topk_pipelines = 11;
+static constexpr uint32_t num_topk_pipelines = 14;
 
 static constexpr std::initializer_list<ggml_op> topk_moe_early_softmax_norm{ GGML_OP_SOFT_MAX, GGML_OP_RESHAPE,  GGML_OP_ARGSORT,
                                                                              GGML_OP_VIEW,     GGML_OP_GET_ROWS, GGML_OP_RESHAPE,
@@ -894,6 +904,12 @@ struct vk_device_struct {
     bool subgroup_clustered;
     bool subgroup_vote;
     bool multi_add;
+    // DeepSeek-V4 hyper-connection ops; off falls back to the primitive chain.
+    // Per-op so a misbehaving kernel can be bisected against the unfused graph.
+    bool dsv4_hc_comb;
+    bool dsv4_hc_pre;
+    bool dsv4_hc_post;
+    bool lightning_indexer;
     bool shader_int64;
     bool buffer_device_address;
     bool vulkan_memory_model;
@@ -901,6 +917,7 @@ struct vk_device_struct {
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
     uint32_t max_nodes_per_submit;
+    uint64_t max_bytes_per_submit;
 
     bool shader_64b_indexing;
 
@@ -978,7 +995,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_quantize_q8_1_x4;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
-    vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
+    // Fused dequant+transpose shader for FA quant-KV (per-head-contiguous f16 scratch).
+    // All five q-types (q8_0/q4_0/q4_1/q5_0/q5_1) ship today; index by source KV type so the dispatch can probe availability.
+    vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_mul_mat_vec_f32_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -1012,6 +1031,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_add_id_f32;
 
+    vk_pipeline pipeline_concat_transpose_i32;
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
@@ -1150,7 +1170,6 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     vk_pipeline pipeline_gated_linear_attn_f32;
-    vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
@@ -1179,6 +1198,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;
+    vk_pipeline pipeline_mmid_row_lists;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
@@ -1196,6 +1216,12 @@ struct vk_device_struct {
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
+    // FA quant-KV dequant+transpose scratch control (CachyLLama). Mirrors upstream
+    // ggml-org/llama.cpp#25494; on memory-constrained boxes the scratch can be
+    // bigger than available RAM so we let users tune or disable it.
+    bool fa_no_scratch_transpose;       // GGML_VK_NO_FA_SCRATCH_TRANSPOSE
+    uint64_t fa_scratch_safety_bytes;   // GGML_VK_FA_SCRATCH_SAFETY_MB (default 1024 MB)
+    bool fa_scratch_force;              // GGML_VK_FA_SCRATCH_FORCE - bypass MemAvailable gate
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
@@ -2002,26 +2028,7 @@ struct vk_op_gated_linear_attn_push_constants {
     uint32_t H;
     float scale;
 };
-struct vk_op_lightning_indexer_push_constants {
-    uint32_t n_kv;
-    uint32_t n_heads;
-    uint32_t n_tokens;
-    uint32_t n_streams;
-    uint32_t n_masks;
-    uint32_t dispatch_x;
-    uint32_t q_nb1;
-    uint32_t q_nb2;
-    uint32_t q_nb3;
-    uint32_t k_nb2;
-    uint32_t k_nb3;
-    uint32_t w_nb1;
-    uint32_t w_nb3;
-    uint32_t m_nb1;
-    uint32_t m_nb3;
-    uint32_t d_nb1;
-    uint32_t d_nb3;
-};
-static_assert(sizeof(vk_op_lightning_indexer_push_constants) <= 128);
+
 struct vk_op_gated_delta_net_push_constants {
     uint32_t H;
     uint32_t n_tokens;
@@ -2307,6 +2314,20 @@ static bool vk_enable_sync_logger = false;
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
 
+// Total memory traffic of a node (dst + srcs). Used to bound command buffer
+// execution time for bandwidth-bound ops with no flops estimate (large copies,
+// set_rows, mask fills at long context) - packing too many of them into one
+// submission can exceed the driver timeout.
+static uint64_t ggml_vk_get_node_bytes(const ggml_tensor * node) {
+    uint64_t bytes = ggml_nbytes(node);
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node->src[i]) {
+            bytes += ggml_nbytes(node->src[i]);
+        }
+    }
+    return bytes;
+}
+
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
         const uint64_t m     = node->ne[0];
@@ -2424,6 +2445,20 @@ class vk_perf_logger {
         }
         if (node->op == GGML_OP_UNARY) {
             return fusion_str + ggml_unary_op_name(ggml_get_unary_op(node));
+        }
+        if (node->op == GGML_OP_MUL && getenv("GGML_VK_PERF_SHAPES")) {
+            std::string name = "MUL ";
+            name += "dst(" + std::to_string(node->ne[0]) + "," + std::to_string(node->ne[1]) + "," +
+                    std::to_string(node->ne[2]) + ") b(" + std::to_string(node->src[1]->ne[0]) + "," +
+                    std::to_string(node->src[1]->ne[1]) + "," + std::to_string(node->src[1]->ne[2]) + ")";
+            name += std::string(" a=") + ggml_op_name(node->src[0]->op);
+            if (node->src[0]->op == GGML_OP_UNARY) { name += std::string(":") + ggml_unary_op_name(ggml_get_unary_op(node->src[0])); }
+            name += std::string(" b=") + ggml_op_name(node->src[1]->op);
+            if (node->src[1]->op == GGML_OP_UNARY) { name += std::string(":") + ggml_unary_op_name(ggml_get_unary_op(node->src[1])); }
+            if (node->src[1]->op == GGML_OP_RESHAPE && node->src[1]->src[0]) {
+                name += std::string("(") + ggml_op_name(node->src[1]->src[0]->op) + ")";
+            }
+            return fusion_str + name;
         }
         if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
             const uint64_t m     = node->ne[0];
@@ -2655,6 +2690,33 @@ static uint32_t ggml_vk_concat_unit_size(ggml_type type) {
         return 2;
     }
     return 1;
+}
+
+// Tiled-transpose dispatch gate for dim-0 concat whose src1 is actually transposed.
+// The generic kernel reads src1 with the transposed stride, so neighbouring lanes touch
+// different cache lines; the tiled-transpose kernel (concat_transpose.comp) stages a
+// 32x32 tile in shared memory instead, keeping both the load and store coalesced.
+//
+// On by default to match the rest of the f16 KV / quant-KV opt-in pattern; =0 disables.
+static bool ggml_vk_concat_is_transposed(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const char * env = getenv("GGML_VK_CONCAT_TRANSPOSE");
+    if (!(env && atoi(env) != 0)) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(dst, 0) != 0) {           // dim 0 only
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(src0->type);
+    if (src0->nb[0] != ts || dst->nb[0] != ts) {          // src0 and dst rows must be contiguous
+        return false;
+    }
+    if (src1->nb[0] <= src1->nb[1]) {                     // src1 must actually be transposed
+        return false;
+    }
+    return src0->ne[1] == src1->ne[1] && dst->ne[1] == src1->ne[1];
 }
 
 static bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
@@ -4054,7 +4116,41 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
     result.subgroup_size = device->subgroup_size;
+
+    // Pin a 32-wide subgroup only where narrowing is free. The shader derives cols_per_iter,
+    // threads_per_rowgroup and every strided load loop from gl_WorkGroupSize.x, and
+    // workgroup_size is num_subgroups * subgroup_size, so threads_per_rowgroup always equals the
+    // real subgroup size. Halving the subgroup halves the workgroup, and the per-lane O state
+    // grows as d_per_thread = ceil((HSV/4) / threads_per_rowgroup). Pin only when that count is
+    // unchanged. Above that point the narrow subgroup issues roughly 1.5x to 1.8x the
+    // instructions for the same number of SIMD passes, which loses on an issue-bound kernel:
+    // hd256 measures 6 to 18 percent slower. The test depends on HSV only; HSK does not enter
+    // d_per_thread. On a 64-wide device it reduces exactly to hsv <= 128.
+    // =1 applies the rule; =2 forces the pin regardless of head size, for measuring the
+    // configurations the rule rejects. Diagnostic only.
+    static const int fa_wave32 = [] {
+        const char * e = getenv("GGML_VK_FA_WAVE32");
+        return e ? atoi(e) : 1;  // default ON: pin a 32-wide subgroup on RDNA where
+                                  // narrowing is free. Override with =0 to disable.
+    }();
+    if (fa_wave32 != 0 &&
+        device->subgroup_size_control &&
+        32 < device->subgroup_size &&                              // narrow only, never widen
+        device->subgroup_min_size <= 32 && 32 <= device->subgroup_max_size &&
+        (result.block_cols % 32) == 0 &&                           // cols_per_thread stays >= 1
+        (result.block_cols * result.block_rows / 4) >= num_subgroups * 32 &&  // mask_cache != 0
+        (fa_wave32 == 2 ||
+         CEIL_DIV(hsv / 4, 32u) == CEIL_DIV(hsv / 4, device->subgroup_size))) {
+        result.subgroup_size = 32;
+    }
+
     result.workgroup_size = num_subgroups * result.subgroup_size;
+
+    // threads_per_rowgroup == the real subgroup size is load-bearing in three places:
+    // the subgroupMax row reduction, the subgroupAdd of Lf, and tmpsh[gl_SubgroupID], which is
+    // sized by row_split and would be written out of bounds if gl_NumSubgroups exceeded it.
+    GGML_ASSERT(result.workgroup_size == result.row_split * result.subgroup_size);
+    GGML_ASSERT(result.block_cols % result.subgroup_size == 0);
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
     result.d_split = std::min(std::min(result.subgroup_size, 8u), D_lsb / 4);
@@ -4152,14 +4248,6 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
     return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
 }
 
-// Bytes per buffer block for the FaBlockBytesK/V spec constants. F32 is fed as
-// a vec4 "block" of 4 floats, everything else uses its ggml block size.
-static uint32_t fa_block_bytes(ggml_type t) {
-    if (t == GGML_TYPE_F32) {
-        return 16u;
-    }
-    return (uint32_t) ggml_type_size(t);
-}
 
 static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& state) {
     return {
@@ -5713,7 +5801,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q5_0], "dequant_q5_0", dequant_q5_0_len, dequant_q5_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q5_1], "dequant_q5_1", dequant_q5_1_len, dequant_q5_1_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q8_0], "dequant_q8_0", dequant_q8_0_len, dequant_q8_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    // Fused dequant+transpose for FA quant-KV scratch (q4_0/q4_1/q5_0/q5_1/q8_0 plus f16 contiguize).
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q4_0], "dequant_q4_0_transpose", dequant_q4_0_transpose_len, dequant_q4_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q4_1], "dequant_q4_1_transpose", dequant_q4_1_transpose_len, dequant_q4_1_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q5_0], "dequant_q5_0_transpose", dequant_q5_0_transpose_len, dequant_q5_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q5_1], "dequant_q5_1_transpose", dequant_q5_1_transpose_len, dequant_q5_1_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q8_0], "dequant_q8_0_transpose", dequant_q8_0_transpose_len, dequant_q8_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    // Strided-copy counterpart for FA f16 KV (contiguize pass). GGML_VK_FA_KV_CONTIG gates it.
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_F16], "dequant_f16_transpose", dequant_f16_transpose_len, dequant_f16_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 8, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q2_K], "dequant_q2_k", dequant_q2_k_len, dequant_q2_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q3_K], "dequant_q3_k", dequant_q3_k_len, dequant_q3_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q4_K], "dequant_q4_k", dequant_q4_k_len, dequant_q4_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
@@ -5957,6 +6052,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_concat_i8, "concat_i8", concat_i8_len, concat_i8_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+    // One workgroup per 32x32 tile: elements are passed as (rows, cols, 1).
+    ggml_vk_create_pipeline(device, device->pipeline_concat_transpose_i32, "concat_transpose_i32", concat_transpose_i32_len, concat_transpose_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
@@ -6229,16 +6326,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_gated_linear_attn_f32, "gated_linear_attn_f32", gated_linear_attn_f32_len, gated_linear_attn_f32_data, "main", 6, sizeof(vk_op_gated_linear_attn_push_constants), {1, 1, 1}, {}, 1);
 
-    {
-        const bool li_subgroup = device->subgroup_arithmetic && device->subgroup_require_full_support;
-        const size_t li_len   = li_subgroup ? lightning_indexer_subgroup_f32_len  : lightning_indexer_f32_len;
-        const void * li_data  = li_subgroup ? (const void *)lightning_indexer_subgroup_f32_data : (const void *)lightning_indexer_f32_data;
-
-        for (ggml_type k_type : lightning_indexer_k_types) {
-            const std::string name = "lightning_indexer_" + std::string(ggml_type_name(k_type)) + "_k_f32";
-            ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32[k_type], name.c_str(), li_len, li_data, "main", 5, sizeof(vk_op_lightning_indexer_push_constants), {1, 1, 1}, {(uint32_t)k_type, fa_block_bytes(k_type), device->subgroup_size}, 1, true, li_subgroup);
-        }
-    }
 
     {
         const uint32_t gdn_sizes[] = {16, 32, 64, 128};
@@ -6599,6 +6686,28 @@ static vk_device ggml_vk_get_device(size_t idx) {
         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
 
+        // CachyLLama: FA quant-KV dequant+transpose scratch control.
+        // The scratch holds one layer's worth of f16 K+V (~256-512 MB at 128k context) so
+        // q8_0 prefill can use the coalesced f16 FA path. On 32 GB boxes with long context the
+        // scratch can be bigger than the available RAM, so we let users tune or disable.
+        device->fa_no_scratch_transpose = getenv("GGML_VK_NO_FA_SCRATCH_TRANSPOSE") != nullptr;
+        device->fa_scratch_force         = getenv("GGML_VK_FA_SCRATCH_FORCE") != nullptr;
+        {
+            const char * env = getenv("GGML_VK_FA_SCRATCH_SAFETY_MB");
+            uint64_t safety_mb = 1024;  // 1 GB default safety margin
+            if (env != nullptr) {
+                char * end = nullptr;
+                unsigned long long v = strtoull(env, &end, 10);
+                if (end != env && *end == '\0' && v > 0) {
+                    safety_mb = (uint64_t) v;
+                } else {
+                    GGML_LOG_WARN("ggml_vulkan: GGML_VK_FA_SCRATCH_SAFETY_MB=%s is not a positive integer; using default %llu MB\n",
+                                  env, (unsigned long long) safety_mb);
+                }
+            }
+            device->fa_scratch_safety_bytes = safety_mb * 1024ULL * 1024ULL;
+        }
+
         bool fp16_storage = false;
         bool fp16_compute = false;
         bool maintenance4_support = false;
@@ -6836,11 +6945,34 @@ static vk_device ggml_vk_get_device(size_t idx) {
                                 (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote);
 
         // Submit at least every 100 nodes, in case there are workloads without as much matmul.
-        device->max_nodes_per_submit = 100;
+        // APU/iGPU workaround: large compute batches can exceed the kernel's 2s
+        // amdgpu.lockup_timeout and fragment the SA suballocator, surfacing as
+        // "radv/amdgpu: Not enough memory for command submission" followed by
+        // vk::Queue::submit: ErrorDeviceLost. The conservative default on UMA
+        // was 8 nodes per submit; raising it gives a reproducible +4.5% on tg64
+        // (CachyLLama RDNA3, Phoenix1/Phoenix, gfx1103, e.g. 7840U, Qwen3.6-35B
+        // Q4_K_XL: nps=100 vs nps=8). Discrete GPUs handle more work per submit
+        // safely; 100 was the prior default there. A universal 64 hits the
+        // safe middle ground: ~93% of the nps=100 win on 7840U, well under the
+        // amdgpu timeout on any UMA device, and removes the UMA/discrete
+        // special case so the same default works on Strix Halo (gfx1151) too.
+        // Users can override via GGML_VK_NODES_PER_SUBMIT.
+        device->max_nodes_per_submit = 64;
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
-        if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
-            uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
+        const char* GGML_VK_NODES_PER_SUBMIT    = getenv("GGML_VK_NODES_PER_SUBMIT");
+        const char * env_val = GGML_VK_NODES_PER_SUBMIT ? GGML_VK_NODES_PER_SUBMIT : GGML_VK_MAX_NODES_PER_SUBMIT;
+        if (env_val != nullptr) {
+            uint32_t max_nodes_per_submit = std::stoul(env_val);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
+        }
+
+        // Also submit once a batch has accumulated enough memory traffic, so that
+        // bandwidth-bound nodes with no flops estimate cannot grow a command buffer
+        // past the driver timeout. 0 disables the limit.
+        device->max_bytes_per_submit = 8ull * 1024 * 1024 * 1024;
+        const char* GGML_VK_MAX_MB_PER_SUBMIT = getenv("GGML_VK_MAX_MB_PER_SUBMIT");
+        if (GGML_VK_MAX_MB_PER_SUBMIT != nullptr) {
+            device->max_bytes_per_submit = std::stoull(GGML_VK_MAX_MB_PER_SUBMIT) * 1024 * 1024;
         }
 
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
@@ -7103,6 +7235,18 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 subgroup_size_control_features.subgroupSizeControl;
 
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
+
+        // Compute subgroup-gated feature flags now that subgroup_require_full_support
+        // has been finalised. Previously these were assigned earlier (before the
+        // computeFullSubgroups probe) and would always evaluate to false on devices
+        // that enable subgroup_size_control.
+        const bool dsv4_hc_all = getenv("GGML_VK_DISABLE_DSV4_HC") == nullptr;
+        device->dsv4_hc_comb = dsv4_hc_all && getenv("GGML_VK_DISABLE_DSV4_HC_COMB") == nullptr;
+        device->dsv4_hc_pre  = dsv4_hc_all && getenv("GGML_VK_DISABLE_DSV4_HC_PRE")  == nullptr;
+        device->dsv4_hc_post = dsv4_hc_all && getenv("GGML_VK_DISABLE_DSV4_HC_POST") == nullptr;
+
+        device->lightning_indexer = getenv("GGML_VK_DISABLE_LIGHTNING_INDEXER") == nullptr &&
+                                    device->subgroup_arithmetic && device->subgroup_require_full_support;
 
 #if defined(VK_KHR_cooperative_matrix)
         device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;
@@ -9257,7 +9401,9 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         }
     }
 
-    // Same, for a 0<->2 swap: src dim2 is the innermost dimension.
+// Same idea for a 0<->2 swap (ggml_cont(ggml_permute(x, 2, 1, 0, 3))): src
+    // dim2 is innermost. Without this it falls to the generic strided copy,
+    // whose reads stride by ne0*ne1 -- one cache line per lane.
     bool transpose02 = dst && !contig && src->nb[2] == ggml_type_size(to) &&
                        ggml_is_contiguous(dst) && ggml_are_same_shape(dst, src);
 
@@ -10495,7 +10641,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     }
 }
 
-static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * fused_scale = nullptr, ggml_tensor * fused_dst = nullptr) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
@@ -10533,7 +10679,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                 hoisted_row_id_words * sizeof(uint32_t) <=
                                     ctx->device->properties.limits.maxStorageBufferRange;
 
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    // When the following MUL is fused in, write the scaled result straight to its destination.
+    const ggml_tensor * out_dst = fused_dst ? fused_dst : dst;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)out_dst->buffer->context;
     ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
     ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
@@ -10625,6 +10773,24 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline_map(ctx, *mmp_map, ne01, nei1, aligned, true);
 
+    // CachyLLama: keep padded_N for the carry's fused-scale + use_row_lists push constants.
+    // (Upstream 77f132cb1 removed this in favor of K-padding for the bare mmid path, but
+    // our mul_mat_mat_id pipeline is more advanced and still uses padded_N for the Y staging.)
+    const uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
+
+    // PROBE (GGML_VK_MMID_PROBE=1): which mmid tile actually runs, and with how many threads.
+    static const char * mmid_probe_env = getenv("GGML_VK_MMID_PROBE");
+    if (mmid_probe_env && atoi(mmid_probe_env) != 0) {
+        static std::set<std::string> seen;
+        uint32_t n_for_tile = (uint32_t)nei1;
+        std::string key = pipeline->name + ":" + std::to_string(n_for_tile);
+        if (seen.insert(key).second) {
+            fprintf(stderr, "ggml_vulkan: mmid pipeline=%s n_for_tile=%u m=%u wg=(%u,%u,%u)\n",
+                    pipeline->name.c_str(), n_for_tile, (uint32_t)ne01,
+                    pipeline->wg_denoms[0], pipeline->wg_denoms[1], pipeline->wg_denoms[2]);
+        }
+    }
+
     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
     }
@@ -10712,10 +10878,13 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
         ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+        if (use_row_lists) {
+            ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_mmid_row_lists, 1);
+        }
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
-    const uint64_t d_buf_offset = vk_tensor_offset(dst) + dst->view_offs;
+    const uint64_t d_buf_offset = vk_tensor_offset(out_dst) + out_dst->view_offs;
     GGML_ASSERT(d_D != nullptr);
     vk_buffer d_X;
     uint64_t x_buf_offset = 0;
@@ -10831,6 +11000,19 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         }
     }
     ggml_vk_sync_buffers(ctx, subctx);
+
+    if (use_row_lists) {
+        // Prefix-sum the expert counts and scatter (ii0, ii1) into per-expert row lists
+        const std::vector<uint32_t> pc = { (uint32_t)nei0,
+                                           (uint32_t)nei1,
+                                           (uint32_t)(nbi0 / ggml_type_size(ids->type)),
+                                           (uint32_t)(nbi1 / ggml_type_size(ids->type)),
+                                           (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
+                                           (uint32_t)n_as };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mmid_row_lists,
+            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { 1, 1, 1});
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
 
     uint32_t stride_batch_x = ne00*ne01;
     uint32_t stride_b_y = y_needs_k_padding ? y_staged_row_stride : ne10;
@@ -11115,7 +11297,16 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
     if (ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
         ggml_vk_mul_mat_vec_id_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
-        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst);
+        // Fused scale epilogue: the MUL's other operand is applied as the matmul writes out,
+        // and the result goes straight to the MUL's destination.
+        const ggml_tensor * fused_scale = nullptr;
+        ggml_tensor * fused_dst = nullptr;
+        if (ctx->num_additional_fused_ops == 1) {
+            ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+            fused_scale = (mul->src[0] == dst) ? mul->src[1] : mul->src[0];
+            fused_dst   = mul;
+        }
+        ggml_vk_mul_mat_id_q_f16(ctx, subctx, src0, src1, src2, dst, fused_scale, fused_dst);
     }
 }
 
@@ -11170,6 +11361,27 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
     return supported;
 }
 
+// Single source of truth for native FA K/V types. Anything outside this list is only correct
+// through the dequant-once scratch path, so supports_op and the dispatch-time dequant gate
+// must agree on when that path runs. iq4_nl is native since upstream 8161641.
+static bool ggml_vk_fa_kv_native(ggml_type t, bool coopmat2) {
+    GGML_UNUSED(coopmat2);
+    switch (t) {
+    case GGML_TYPE_F32:
+    case GGML_TYPE_F16:
+    case GGML_TYPE_BF16:
+    case GGML_TYPE_Q4_0:
+    case GGML_TYPE_Q4_1:
+    case GGML_TYPE_Q5_0:
+    case GGML_TYPE_Q5_1:
+    case GGML_TYPE_Q8_0:
+    case GGML_TYPE_IQ4_NL:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
     GGML_UNUSED(v_type);
     // Needs to be kept up to date on shader changes
@@ -11193,8 +11405,8 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t qstride = hsk_pad / 4 + 2;
     const uint32_t Qf = Br * qstride * f16vec4;
 
-    const uint32_t psh_stride = Br / 4 + 2;
-    const uint32_t Psh = Bc * psh_stride * f16vec4;
+    const uint32_t psh_stride = Bc / 4 + 2;
+    const uint32_t Psh = Br * psh_stride * f16vec4;
 
     const uint32_t sfshstride = (hsk <= 128) ? (Br + 8) : Br;
     const uint32_t sfsh = Bc * sfshstride * acctype;
@@ -11276,7 +11488,18 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     uint32_t workgroups_z = (uint32_t)neq3;
 
     const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
-
+    
+// CachyLLama (upstream ggml-org/llama.cpp#25494): at prefill with quantized K/V,
+    // the coopmat1 path re-dequantizes the whole KV cache inside every Q workgroup and
+    // reads it strided. Dequant+transpose into a per-head-contiguous f16 scratch once,
+    // then run the f16 FA path: faster on memory-bound UMA hardware (Strix Halo etc.)
+    // because the FA reads coalesced and the dequant runs once instead of 32x.
+    //
+    // The scratch is one layer's worth of f16 K+V = 2 * head_dim * KV * n_head_kv * 2 bytes.
+    // At 128k context that's ~256 MB (head_dim 128) to ~512 MB (head_dim 256). On 32 GB
+    // boxes with long context the scratch can exceed MemAvailable, so we gate on host RAM
+    // unless the user opted out (GGML_VK_NO_FA_SCRATCH_TRANSPOSE) or forced it
+    // (GGML_VK_FA_SCRATCH_FORCE).
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
         return t->nb[0] == ggml_type_size(t->type) &&
@@ -11286,26 +11509,80 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
-    const bool use_dequant_kv = k_quant && v_quant && neq1 >= 64 &&
-                                is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
-                                (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
-                                ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
-                                // coopmat2 path does not benefit from the f16 scratch
-                                !ctx->device->coopmat2 &&
-                                // Intel Xe1 regresses, see PR 25494
-                                (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
-                                 (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+    // EXPERIMENT (GGML_VK_FA_KV_CONTIG=1): the same contiguize pass for f16 K/V. The
+    // KV-cache view reaching FA is head-interleaved ([HS, NH, KV] physically), and the
+    // cm1 direct-from-global coopMatLoads run ~2-5x slower on those strided rows than
+    // on per-head-contiguous K/V. dequant_f16_transpose.comp is a pure strided copy.
+    // Engages only when the rows are actually strided, prefill only (N >= 64).
+    static const char * fa_kv_contig_env = getenv("GGML_VK_FA_KV_CONTIG");
+    const bool fa_kv_contig = !(fa_kv_contig_env && fa_kv_contig_env[0] == '0');
+    const bool kv_f16_strided = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                                N >= 64 &&
+                                (k->nb[1] != (uint64_t)HSK * sizeof(ggml_fp16_t) ||
+                                 v->nb[1] != (uint64_t)HSV * sizeof(ggml_fp16_t)) &&
+                                (HSK % 8) == 0 && (HSV % 8) == 0;
+    bool use_dequant_kv = !ctx->device->fa_no_scratch_transpose &&
+                          ((k_quant && v_quant) || (fa_kv_contig && kv_f16_strided)) && N >= 64 &&
+                          k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+                          k->nb[1] >= k->nb[2] && v->nb[1] >= v->nb[2] &&
+                          ggml_is_contiguously_allocated(k) && ggml_is_contiguously_allocated(v) &&
+                          (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                          (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                          ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
+                          ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
+                          !ctx->device->coopmat2;
+    if (use_dequant_kv && !ctx->device->fa_scratch_force) {
+        const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t);
+        const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t);
+        const uint64_t required = k_f16_sz + v_f16_sz + ctx->device->fa_scratch_safety_bytes;
+
+        // host_available_ram_query returns false on platforms we can't read
+        // reliably (Windows, kernels older than 3.14, sysinfo() failure).
+        // When the answer is unknown, fall back to the slow path rather than
+        // risk an OOM by trusting a fabricated 8 GiB.
+        std::size_t avail_ram = 0;
+        bool known = common::host_available_ram_query(&avail_ram);
+
+        if (!known) {
+            static std::atomic<bool> warned_unknown{false};
+            if (!warned_unknown.exchange(true)) {
+                GGML_LOG_WARN("ggml_vulkan: FA quant-KV scratch gate: cannot query host RAM on this platform; "
+                              "using slow path. Set GGML_VK_FA_SCRATCH_FORCE=1 to override, "
+                              "or GGML_VK_NO_FA_SCRATCH_TRANSPOSE=1 to silence.\n");
+            }
+            use_dequant_kv = false;
+        } else {
+            // On UMA hardware (Strix Halo, Apple Silicon, AMD APU, Intel
+            // integrated) the GPU memory pool IS host RAM. MemAvailable
+            // counts the reclaimable page cache, but reclaiming it hurts
+            // SSD read-ahead and other system services. Reserve a 30%
+            // headroom so the kernel doesn't have to thrash cache to satisfy
+            // a scratch allocation on the GPU side.
+            if (ctx->device->uma) {
+                avail_ram = (avail_ram * 7) / 10;
+            }
+            if (required > avail_ram) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    GGML_LOG_WARN("ggml_vulkan: FA quant-KV dequant scratch (%llu MiB incl. %llu MiB safety) exceeds host RAM; using slow path. Set GGML_VK_NO_FA_SCRATCH_TRANSPOSE=1 to silence this check.\n",
+                                  (unsigned long long) (required / (1024ULL * 1024ULL)),
+                                  (unsigned long long) (ctx->device->fa_scratch_safety_bytes / (1024ULL * 1024ULL)));
+                }
+                use_dequant_kv = false;
+            }
+        }
+    }
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
 
-    // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
+    // For scalar/coopmat1 FA, we can use the "large" size to accommodate gqa.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k_type_eff, v_type_eff, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
+    // GQA packing (N := gqa_ratio) is only valid for single-token decode.
+    // Multi-token speculative verify must use the normal FA path (upstream #26358).
+    if (neq1 == 1 && N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -11353,6 +11630,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         v_stride /= 4;
     }
 
+    // When the dequant scratch is engaged, the FA reads the per-head-contiguous f16
+    // layout, so the strides and buffer sizes collapse to plain contiguous ones.
     uint32_t nbk2_eff = (uint32_t)nbk2, nbk3_eff = (uint32_t)nbk3;
     uint32_t nbv2_eff = (uint32_t)nbv2, nbv3_eff = (uint32_t)nbv3;
     if (use_dequant_kv) {
@@ -11512,6 +11791,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
     vk_subbuffer sparse_buf = use_sparse ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
 
+    // CachyLLama (upstream #25494): run the dequant+transpose shader to materialize
+    // the FA scratch in prealloc_x and point K/V at it. One pass per K and V.
     if (use_dequant_kv) {
         const uint64_t fp = sizeof(ggml_fp16_t);
         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * fp;
@@ -11536,6 +11817,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         { const std::vector<uint32_t> pc = { (uint32_t)HSV, (uint32_t)nev2, (uint32_t)KV, 0, v_nel };
           ggml_vk_dispatch_pipeline(ctx, subctx, tr_v, { v_buf, v_dst }, pc, { v_nel, 1, 1 }); }
         ggml_vk_sync_buffers(ctx, subctx);
+        ctx->prealloc_x_need_sync = true;
         k_buf = k_dst;
         v_buf = v_dst;
     }
@@ -11762,6 +12044,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_CONCAT: {
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
+        }
+        // Tiled-transpose path handles unquantized 4-byte elements only.
+        if (!ggml_is_quantized(src0->type) && ggml_vk_concat_unit_size(src0->type) == 4 &&
+            ggml_vk_concat_is_transposed(src0, src1, dst)) {
+            return ctx->device->pipeline_concat_transpose_i32;
         }
         switch (ggml_vk_concat_unit_size(src0->type)) {
         case 1:
@@ -12199,11 +12486,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_gated_linear_attn_f32;
         }
         return nullptr;
-    case GGML_OP_LIGHTNING_INDEXER:
-        // only the k type selects a pipeline, the other types are fixed by ggml_lightning_indexer()
-        if (ggml_vk_lightning_indexer_k_type_supported(src1->type)) {
-            return ctx->device->pipeline_lightning_indexer_f32[src1->type];
-        }
+
         return nullptr;
     case GGML_OP_GATED_DELTA_NET:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -12795,6 +13078,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_GLU:
     case GGML_OP_CONV_2D_DW:
         {
+            // The tiled concat_transpose kernel is dispatched per 32x32 tile, not per element.
+            if (op == GGML_OP_CONCAT && pipeline == ctx->device->pipeline_concat_transpose_i32) {
+                elements = { (uint32_t)src1->ne[1], (uint32_t)src1->ne[0], 1 };
+                break;
+            }
             uint32_t ne = ggml_nelements(dst);
             if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
                 // Convert from number of logical elements to 2- or 4-byte units.
@@ -13331,58 +13619,7 @@ static void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context&
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], dst_buf},
         pc, { (uint32_t)(n_seqs * n_heads), 1, 1 });
-}
-
-static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * q = dst->src[0];
-    const ggml_tensor * k = dst->src[1];
-    const ggml_tensor * w = dst->src[2];
-    const ggml_tensor * m = dst->src[3];
-
-    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, q, k, w, dst, dst->op);
-    GGML_ASSERT(pipeline != nullptr);
-
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-
-    const uint32_t n_kv      = k->ne[2];
-    const uint32_t n_heads   = q->ne[1];
-    const uint32_t n_tokens  = q->ne[2];
-    const uint32_t n_streams = q->ne[3];
-    const uint32_t n_masks   = m->ne[3];
-
-    const uint32_t n_outputs = (uint32_t)(dst->ne[0] * dst->ne[1] * dst->ne[3]);
-    const uint32_t dispatch_x = std::min(n_outputs, ctx->device->properties.limits.maxComputeWorkGroupCount[0]);
-    const uint32_t dispatch_y = CEIL_DIV(n_outputs, dispatch_x);
-
-    // q, w and dst are f32 and m is f16, so their strides are passed in elements;
-    // k may be quantized, so its strides stay in bytes
-    const uint32_t q_nb1 = q->nb[1] / sizeof(float);
-    const uint32_t q_nb2 = q->nb[2] / sizeof(float);
-    const uint32_t q_nb3 = q->nb[3] / sizeof(float);
-    const uint32_t k_nb2 = k->nb[2];
-    const uint32_t k_nb3 = k->nb[3];
-    const uint32_t w_nb1 = w->nb[1] / sizeof(float);
-    const uint32_t w_nb3 = w->nb[3] / sizeof(float);
-    const uint32_t m_nb1 = m->nb[1] / sizeof(ggml_fp16_t);
-    const uint32_t m_nb3 = m->nb[3] / sizeof(ggml_fp16_t);
-    const uint32_t d_nb1 = dst->nb[1] / sizeof(float);
-    const uint32_t d_nb3 = dst->nb[3] / sizeof(float);
-
-    const vk_op_lightning_indexer_push_constants pc = {
-        n_kv, n_heads, n_tokens, n_streams, n_masks, dispatch_x,
-        q_nb1, q_nb2, q_nb3,
-        k_nb2, k_nb3,
-        w_nb1, w_nb3,
-        m_nb1, m_nb3,
-        d_nb1, d_nb3,
-    };
-
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {ggml_vk_tensor_subbuffer(ctx, q), ggml_vk_tensor_subbuffer(ctx, k), ggml_vk_tensor_subbuffer(ctx, w), ggml_vk_tensor_subbuffer(ctx, m), ggml_vk_tensor_subbuffer(ctx, dst)},
-        pc, {dispatch_x, dispatch_y, 1});
-}
-
-static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+}static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
     const ggml_tensor * src_beta  = dst->src[4];
@@ -16392,6 +16629,22 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             break;
         }
 
+        // Fused silu(x)*y: run it as a swiglu split, writing straight to the MUL's destination.
+        if (ctx->num_additional_fused_ops == 1) {
+            ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+            ggml_tensor * other = (mul->src[0] == node) ? mul->src[1] : mul->src[0];
+
+            ggml_tensor fused = *mul;
+            fused.op = GGML_OP_GLU;
+            memset(fused.op_params, 0, sizeof(fused.op_params));
+            ggml_set_op_params_i32(&fused, 0, (int32_t) GGML_GLU_OP_SWIGLU);
+            fused.src[0] = node->src[0];
+            fused.src[1] = other;
+
+            ggml_vk_glu(ctx, compute_ctx, fused.src[0], fused.src[1], &fused);
+            break;
+        }
+
         switch (ggml_get_unary_op(node)) {
         case GGML_UNARY_OP_ELU:
         case GGML_UNARY_OP_EXP:
@@ -16596,10 +16849,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
-    case GGML_OP_LIGHTNING_INDEXER:
-        ggml_vk_lightning_indexer(ctx, compute_ctx, node);
-
-        break;
 
     case GGML_OP_GATED_DELTA_NET:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
@@ -17519,15 +17768,61 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         }
     }
 
+    // EXPERIMENT (GGML_VK_FUSE_UNARY_MUL=1): silu(x)*y is emitted as two nodes by the delta-net
+    // path, so the silu result makes a full round trip through memory. That is the same shape
+    // swiglu-split already computes in one pass, so route the pair to the existing GLU pipeline.
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
+        static const char * env = getenv("GGML_VK_FUSE_UNARY_MUL");
+        if (!(env && atoi(env) != 0)) {
+            return false;
+        }
+        const ggml_tensor * unary = cgraph->nodes[node_idx];
+        const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+
+        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU) {
+            return false;
+        }
+        if (mul->src[0] != unary && mul->src[1] != unary) {
+            return false;
+        }
+        const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+        // The GLU split shader walks both inputs and the output with the same element count.
+        if (unary->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_are_same_shape(unary, other) || !ggml_are_same_shape(unary, mul)) {
+            return false;
+        }
+        if (!ggml_is_contiguous(unary->src[0]) || !ggml_is_contiguous(other) || !ggml_is_contiguous(mul)) {
+            return false;
+        }
+        return true;
+    }
+
     auto const &mmid_mul_ok = [&](const ggml_tensor *mmid, const ggml_tensor *mul) {
         const ggml_tensor *scale = mul->src[1];
 
         if (mmid != mul->src[0]) {
             return false;
         }
-        // mat-vec only
+        // EXPERIMENT (GGML_VK_MMID_SCALE_EPILOGUE=1): the tile shader can apply the scale as it
+        // writes out, which removes a full write+read of the matmul result at prefill. The
+        // coopmat2 shader has the binding but not the epilogue, so it stays on the old path.
         if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
-            return false;
+            static const char * env = getenv("GGML_VK_MMID_SCALE_EPILOGUE");
+            if (!(env && atoi(env) != 0) || ctx->device->coopmat2) {
+                return false;
+            }
+            // Shader indexes the scale as [token * nei0 + expert_slot].
+            if (scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale)) {
+                return false;
+            }
+            if (get_misalign_bytes(ctx, scale) != 0) {
+                return false;
+            }
+            return scale->ne[0] == 1 &&
+                   scale->ne[1] == mmid->ne[1] && scale->ne[2] == mmid->ne[2] && scale->ne[3] == mmid->ne[3] &&
+                   ggml_are_same_shape(mul, mmid);
         }
         // shaders assume the types match
         if (mmid->type != scale->type) {
@@ -18163,6 +18458,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
+        // Under partial offload the scheduler's async input copies between graph
+        // splits can leave commands in a pending compute ctx. Flush it so the
+        // timestamp stream starts on a fresh command buffer.
+        if (!ctx->compute_ctx.expired()) {
+            ggml_vk_synchronize(ctx);
+        }
         GGML_ASSERT(ctx->compute_ctx.expired());
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
@@ -18189,6 +18490,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint32_t submitted_nodes = 0;
     uint32_t submit_count = 0;
     uint64_t batch_flops = 0;
+    uint64_t batch_bytes = 0;
     uint64_t total_flops = 0;
     uint64_t flops_cap = 200'000'000'000ULL;
 
@@ -18226,6 +18528,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         first_node_in_batch = true;
         submitted_nodes = 0;
         batch_flops = 0;
+        batch_bytes = 0;
         if (submit_count < 3) {
             flops_per_submit *= 2;
         }
@@ -18253,6 +18556,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
 
             batch_flops += node_flops;
+            batch_bytes += ggml_vk_get_node_bytes(cgraph->nodes[i]);
         }
 
         // op_srcs_fused_elementwise indicates whether an op's srcs all contribute to
@@ -18507,6 +18811,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
+                      (ctx->device->max_bytes_per_submit != 0 && batch_bytes >= ctx->device->max_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
@@ -18602,6 +18907,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 // Sort the graph for improved parallelism.
 static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, struct ggml_backend_graph_optimize_params * params)
 {
+    GGML_UNUSED(params);
     VK_LOG_DEBUG("ggml_vk_graph_optimize(" << graph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
@@ -19770,40 +20076,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_GATED_LINEAR_ATTN:
             // the shader block size is hardcoded to head_size 64
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
-        case GGML_OP_LIGHTNING_INDEXER:
-            {
-                const ggml_tensor * q = op->src[0];
-                const ggml_tensor * k = op->src[1];
-                const ggml_tensor * w = op->src[2];
-                const ggml_tensor * m = op->src[3];
-
-                // the q/w/m types and the shape relationships between q, k, w, m and dst
-                // are already asserted in ggml_lightning_indexer()
-                if (!ggml_vk_lightning_indexer_k_type_supported(k->type) || !device->fp16) {
-                    return false;
-                }
-
-                // the shader block size is hardcoded to head size 128
-                if (q->ne[0] != 128) {
-                    return false;
-                }
-
-                // the shader indexes the buffers by element stride, and is dispatched
-                // without allow_misalign
-                for (const ggml_tensor * t : {q, k, w, m, op}) {
-                    if (t->nb[0] != ggml_type_size(t->type) ||
-                        (vk_tensor_offset(t) + t->view_offs) % device->properties.limits.minStorageBufferOffsetAlignment != 0) {
-                        return false;
-                    }
-                    // the strides get scaled down from bytes, so the division must be exact
-                    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-                        if (t->nb[i] % ggml_type_size(t->type) != 0) {
-                            return false;
-                        }
-                    }
-                }
-                return true;
-            }
         case GGML_OP_GATED_DELTA_NET:
             {
                 const uint32_t S_v = op->src[2]->ne[0];
