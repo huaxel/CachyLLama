@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "host-ram.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -49,6 +50,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -1196,6 +1198,9 @@ struct vk_device_struct {
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
+    bool fa_no_scratch_transpose;
+    uint64_t fa_scratch_safety_bytes;
+    bool fa_scratch_force;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
@@ -6599,6 +6604,24 @@ static vk_device ggml_vk_get_device(size_t idx) {
         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
 
+        device->fa_no_scratch_transpose = getenv("GGML_VK_NO_FA_SCRATCH_TRANSPOSE") != nullptr;
+        device->fa_scratch_force = getenv("GGML_VK_FA_SCRATCH_FORCE") != nullptr;
+        {
+            const char * env = getenv("GGML_VK_FA_SCRATCH_SAFETY_MB");
+            uint64_t safety_mb = 1024;
+            if (env != nullptr) {
+                char * end = nullptr;
+                unsigned long long value = strtoull(env, &end, 10);
+                if (end != env && *end == '\0' && value > 0) {
+                    safety_mb = (uint64_t) value;
+                } else {
+                    GGML_LOG_WARN("ggml_vulkan: GGML_VK_FA_SCRATCH_SAFETY_MB=%s is not a positive integer; using default %llu MB\n",
+                                  env, (unsigned long long) safety_mb);
+                }
+            }
+            device->fa_scratch_safety_bytes = safety_mb * 1024ULL * 1024ULL;
+        }
+
         bool fp16_storage = false;
         bool fp16_compute = false;
         bool maintenance4_support = false;
@@ -11286,17 +11309,45 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
-    const bool use_dequant_kv = k_quant && v_quant && neq1 >= 64 &&
-                                is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
-                                (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
-                                ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
-                                ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
-                                // coopmat2 path does not benefit from the f16 scratch
-                                !ctx->device->coopmat2 &&
-                                // Intel Xe1 regresses, see PR 25494
-                                (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
-                                 (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+    bool use_dequant_kv = k_quant && v_quant && neq1 >= 64 &&
+                          is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
+                          (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                          (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
+                          ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
+                          ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
+                          // coopmat2 path does not benefit from the f16 scratch
+                          !ctx->device->coopmat2 &&
+                          // Intel Xe1 regresses, see PR 25494
+                          (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
+                           (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+    if (use_dequant_kv && !ctx->device->fa_scratch_force) {
+        const uint64_t k_f16_size = (uint64_t) ggml_nelements(k) * sizeof(ggml_fp16_t);
+        const uint64_t v_f16_size = (uint64_t) ggml_nelements(v) * sizeof(ggml_fp16_t);
+        const uint64_t required = k_f16_size + v_f16_size + ctx->device->fa_scratch_safety_bytes;
+        std::size_t available_ram = 0;
+        const bool known = common::host_available_ram_query(&available_ram);
+        if (!known) {
+            static std::atomic<bool> warned_unknown { false };
+            if (!warned_unknown.exchange(true)) {
+                GGML_LOG_WARN("ggml_vulkan: FA quant-KV scratch gate: cannot query host RAM; using slow path. "
+                              "Set GGML_VK_FA_SCRATCH_FORCE=1 to override.\n");
+            }
+            use_dequant_kv = false;
+        } else {
+            if (ctx->device->uma) {
+                available_ram = (available_ram * 7) / 10;
+            }
+            if (required > available_ram) {
+                static std::atomic<bool> warned { false };
+                if (!warned.exchange(true)) {
+                    GGML_LOG_WARN("ggml_vulkan: FA quant-KV dequant scratch (%llu MiB incl. %llu MiB safety) exceeds host RAM; using slow path.\n",
+                                  (unsigned long long) (required / (1024ULL * 1024ULL)),
+                                  (unsigned long long) (ctx->device->fa_scratch_safety_bytes / (1024ULL * 1024ULL)));
+                }
+                use_dequant_kv = false;
+            }
+        }
+    }
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = use_dequant_kv ? GGML_TYPE_F16 : v->type;
 
