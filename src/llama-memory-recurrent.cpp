@@ -200,10 +200,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     cell.pos = p0 - 1;
                     return true;
                 }
+                if (pending) {
+                    // A pending snapshot must remain intact; clearing its cells
+                    // would invalidate the restore that the next decode consumes.
+                    return false;
+                }
                 // rollback failed - fall through to regular cell clearing instead of
                 // returning false, which would cause GGML_ABORT in the caller.
                 // The partial rollback is an optimization for recurrent models;
-                // the regular cell clearing loop below handles this case correctly.
+                // the regular cell clearing loop handles this case correctly.
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
