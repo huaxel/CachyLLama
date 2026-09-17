@@ -244,6 +244,42 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-kimi-k3
+        LABEL main
+        ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    # Test state save/load functionality across all architectures, using the generated dummy models
+    llama_test(
+        test-save-load-state
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # Cold-tier cap must also be enforced when checkpoints demote to cold
+    # during on_turn_complete, not only after checkpoint stores
+    llama_build(test-ssd-manager-cold-cap.cpp)
+    target_include_directories(test-ssd-manager-cold-cap PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/tools/server
+    )
+    target_link_libraries(test-ssd-manager-cold-cap PRIVATE server-context)
+    llama_test(
+        test-ssd-manager-cold-cap
+        LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf"
+    )
+    set_tests_properties(test-ssd-manager-cold-cap PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_build(test-fusion.cpp)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
