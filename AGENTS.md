@@ -336,7 +336,7 @@ Run the model with `--moe-residency-debug` (Linux only). The per-decode log line
 
 ### Verifying SSD cache is doing what it claims
 
-Check that the `kv-ssd` on-disk directory uses the expected `conv_hash` or SHA-256 `user_id` prefix (not a raw `user_id`). In router mode each worker's root is `<--cache-ssd path>/<model name>` (namespaced at spawn, `5fe16a2ec`) — two models never share conversation directories. For atomic-write guarantees, kill the server with `kill -9` mid-checkpoint-write and verify that the prior valid index is recoverable on next startup. The `tests/test-kv-ssd-user-isolation` binary exercises both properties without needing a real model.
+Check that the `kv-ssd` on-disk directory uses the expected `conv_hash` or SHA-256 `user_id` prefix (not a raw `user_id`). In router mode a router-level `--cache-ssd` is namespaced per model at preset merge (`<path>/<model name>`), so two models never share conversation directories; a `cache-ssd` set in a model's own preset passes through verbatim — that path belongs to the operator. For atomic-write guarantees, kill the server with `kill -9` mid-checkpoint-write and verify that the prior valid index is recoverable on next startup. The `tests/test-kv-ssd-user-isolation` binary exercises both properties without needing a real model.
 
 ### Independently disabling optimizations
 

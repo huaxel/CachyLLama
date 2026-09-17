@@ -542,32 +542,6 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
     preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
 
-    // Router mode: give every worker its own SSD cache root. Directories below
-    // the root are keyed only by conversation/user hash, never by model, and
-    // each worker allocates checkpoint IDs independently, so two models
-    // sharing one root overwrite each other's ckpt-N.bin and index.bin as
-    // soon as they serve the same user_id or the same conversation hash. The
-    // overwrite is silent: the losing model's checkpoints are gone and it
-    // just sees a clean miss. Namespace the root per model. Single-model
-    // (non-router) servers never render args this way and keep the exact
-    // path the operator passed.
-    std::string ssd_path;
-    if (preset.get_option("LLAMA_ARG_CACHE_SSD", ssd_path) && !ssd_path.empty()) {
-        const std::string sub         = sanitize_model_name_for_path(name);
-        const std::string suffix      = "/" + sub;
-        const bool already_namespaced = !sub.empty() && ssd_path.size() >= suffix.size() &&
-                                        ssd_path.compare(ssd_path.size() - suffix.size(), suffix.size(), suffix) == 0;
-        if (!sub.empty() && !already_namespaced) {
-            std::string namespaced = ssd_path;
-            if (namespaced.back() != '/') {
-                namespaced += '/';
-            }
-            namespaced += sub;
-            SRV_INF("router: SSD cache root for model '%s' namespaced to %s\n", name.c_str(), namespaced.c_str());
-            preset.set_option(ctx_preset, "LLAMA_ARG_CACHE_SSD", namespaced);
-        }
-    }
-
     // TODO: maybe validate preset before rendering ?
     // render args
     args = preset.to_args(bin_path);
@@ -756,9 +730,34 @@ void server_models::load_models() {
     }
 
     // overlay router's own CLI args on top of every model preset so that
-    // e.g. `llama-server --temp 0` is honoured by all child processes
+    // e.g. `llama-server --temp 0` is honoured by all child processes.
+    //
+    // A router-level --cache-ssd path would be shared verbatim by every
+    // worker; namespace it per model so two models cannot overwrite each
+    // other's checkpoints: the directories below the root are keyed only by
+    // conversation/user hash, never by model, and each worker allocates
+    // checkpoint IDs independently, so the last writer silently replaces
+    // the other model's ckpt-N.bin and index.bin. A cache-ssd set in the
+    // model's own preset is left untouched — that path already belongs to
+    // the operator, and appending to it would orphan every existing
+    // checkpoint under it.
+    std::string router_ssd;
+    const bool  base_has_ssd = base_preset.get_option("LLAMA_ARG_CACHE_SSD", router_ssd) && !router_ssd.empty();
     for (auto & [name, preset] : final_presets) {
-        preset.merge(base_preset);
+        common_preset overlay = base_preset;
+        if (base_has_ssd) {
+            const std::string sub = sanitize_model_name_for_path(name);
+            if (!sub.empty()) {
+                std::string namespaced = router_ssd;
+                if (namespaced.back() != '/') {
+                    namespaced += '/';
+                }
+                namespaced += sub;
+                SRV_INF("router: SSD cache root for model '%s' namespaced to %s\n", name.c_str(), namespaced.c_str());
+                overlay.set_option(ctx_preset, "LLAMA_ARG_CACHE_SSD", namespaced);
+            }
+        }
+        preset.merge(overlay);
     }
 
     auto get_source = [&](const std::string & name) {
