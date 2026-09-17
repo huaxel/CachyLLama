@@ -465,7 +465,7 @@ must keep I as a multiple of 32.
 
 The deleted `fewtarius/CachyLLama` remote is preserved as `legacy-upstream`. The active `upstream` remote is now `ggml-org/llama.cpp`; `origin` remains `huaxel/CachyLLama`.
 
-`master` remains the legacy fork branch and is intentionally untouched. The `canonical-port` branch is based on canonical `upstream/master` and carries the CachyLLama features restored during migration. Its checkpoints are build- and test-verified; do not use `make sync` with the default `BRANCH=master` against canonical upstream.
+`master` has been promoted to the verified canonical port. The `canonical-port` branch remains as the migration checkpoint. `origin/master` still points to the legacy fork tip until the promotion is explicitly pushed. Future canonical updates should use the normal `master` workflow; keep `canonical-port` as a recovery reference.
 
 ### Historical fork delta
 
@@ -499,7 +499,7 @@ Running configuration (as of 2026-07-28):
 
 ### Migration verification
 
-The canonical port has been verified with a full Release build, CPU-only and UI-disabled configurations, the full CTest suite, and `test-backend-ops` (18,844/18,844). Future canonical updates should be performed on `canonical-port`, porting fork-only changes deliberately, then reviewed before updating `master` or pushing a deployment.
+The canonical port has been verified with a full Release build, CPU-only and UI-disabled configurations, the full CTest suite, and `test-backend-ops` (18,844/18,844). Review the promotion before pushing `master` to `origin` or deploying it.
 
 ---
 

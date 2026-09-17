@@ -77,9 +77,6 @@ NC := \033[0m
 # --- Sync with upstream ---
 
 sync-merge:
-	@if test "$(BRANCH)" = "master" && git config --get remote.$(UPSTREAM).url | grep -q 'ggml-org/llama.cpp'; then \
-		echo "Refusing to merge canonical upstream into legacy master; use BRANCH=canonical-port" >&2; exit 1; \
-	fi
 	@if test -n "$$(git status --porcelain)"; then \
 		echo "Refusing to sync with a dirty working tree" >&2; exit 1; \
 	fi
@@ -93,9 +90,6 @@ sync-merge:
 	@printf "$(GREEN)✓ $(BRANCH) synced with upstream$(NC)\n"
 
 sync:
-	@if test "$(BRANCH)" = "master" && git config --get remote.$(UPSTREAM).url | grep -q 'ggml-org/llama.cpp'; then \
-		echo "Refusing to rebase canonical upstream onto legacy master; use BRANCH=canonical-port" >&2; exit 1; \
-	fi
 	@if test -n "$$(git status --porcelain)"; then \
 		echo "Refusing to sync with a dirty working tree" >&2; exit 1; \
 	fi
@@ -228,7 +222,6 @@ info:
 	@printf "  make              Shortcut for 'make release'\n"
 	@printf "  make sync         Fetch upstream + rebase + push + build (default)\n"
 	@printf "  make sync-merge   Fetch upstream + merge + push + build\n"
-	@printf "  canonical port    Use BRANCH=canonical-port for canonical upstream syncs\n"
 	@printf "  make deploy       Copy binaries to $(DEPLOY_DIR)\n"
 	@printf "  make restart      systemctl restart llama.cpp\n"
 	@printf "  make all          Full build\n"
@@ -248,6 +241,6 @@ info:
 	@printf "  make server GGML_VULKAN=ON\n"
 	@printf "\n"
 	@printf "Override git remotes if your setup differs:\n"
-	@printf "  make sync UPSTREAM=upstream ORIGIN=origin BRANCH=canonical-port\n"
+	@printf "  make sync UPSTREAM=upstream ORIGIN=origin BRANCH=master\n"
 
 .DEFAULT_GOAL := all
