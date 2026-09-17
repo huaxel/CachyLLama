@@ -279,6 +279,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
     )
 
+    # Router children must get per-model SSD cache roots so two models cannot
+    # overwrite each other's checkpoints through a shared cache path
+    llama_build(test-ssd-router-namespace.cpp)
+    target_link_libraries(test-ssd-router-namespace PRIVATE llama-server-impl)
+    llama_test(
+        test-ssd-router-namespace
+        LABEL main
+    )
+
     llama_build(test-fusion.cpp)
 endif()
 
