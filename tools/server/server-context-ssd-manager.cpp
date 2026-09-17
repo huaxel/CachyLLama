@@ -377,6 +377,11 @@ void server_context_ssd_manager::on_turn_complete(uint32_t turn_id) {
     for (auto& [slot_id, sc] : checkpoints_) {
         sc.turn_id = turn_id;
     }
+
+    // The tier demotions above move warm checkpoints to cold without a
+    // store, growing the global cold tier past --cache-ssd-cold-maxsize.
+    // Re-check the cap here, not only after checkpoint stores.
+    evict_conversations_for_size_locked();
 }
 
 bool server_context_ssd_manager::find_matching_checkpoint(
