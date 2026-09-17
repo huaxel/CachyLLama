@@ -42,7 +42,7 @@
 
 ```bash
 # Clone (with submodules for ggml)
-git clone --recurse-submodules https://github.com/fewtarius/CachyLLama.git
+git clone --recurse-submodules https://github.com/huaxel/CachyLLama.git
 cd CachyLLama
 
 # Build (Vulkan on Linux AMD, Metal on macOS, default CPU elsewhere)
@@ -461,11 +461,13 @@ indefinitely — re-check upstream status each merge.
 `static_assert((I_) % 32 == 0)` to the CASE macro, so any new `rdna3_5` config
 must keep I as a multiple of 32.
 
-## Fork rationale (huaxel/CachyLLama)
+## Canonical upstream migration
 
-`huaxel/CachyLLama` is a downstream fork of `fewtarius/CachyLLama` carrying local-only patches. As of the last sync with `upstream/master` (2026-08-06, `d84ea1ca2`), the fork is **13 commits ahead** (net +1125/−1980 lines). Every commit is exercised on the production deployment described below.
+The deleted `fewtarius/CachyLLama` remote is preserved as `legacy-upstream`. The active `upstream` remote is now `ggml-org/llama.cpp`; `origin` remains `huaxel/CachyLLama`.
 
-### Fork delta
+`master` remains the legacy fork branch and is intentionally untouched. The `canonical-port` branch is based on canonical `upstream/master` and carries the CachyLLama features restored during migration. Its checkpoints are build- and test-verified; do not use `make sync` with the default `BRANCH=master` against canonical upstream.
+
+### Historical fork delta
 
 | Commit | What | Why fork-local (not PR'd yet) | Live on prod? |
 |--------|------|-------------------------------|---------------|
@@ -495,13 +497,9 @@ Running configuration (as of 2026-07-28):
 - **Host RAM:** 62 GiB total (`--cache-ssd-hot-ram 16384 --cache-ssd-warm-ram 32768`)
 - **Threads:** `--threads 14 --threads-batch 28`
 
-### Rebase cost
+### Migration verification
 
-Every `make sync` against `upstream/master` risks conflicts in `tools/server/server-context.cpp`, `common/kv-ssd-*`, and `Makefile`. Recent sync cost ~12 minutes (two conflict resolutions + build + test). The SSD cache code sees active upstream development, so conflicts are expected.
-
-### Reduction strategy
-
-Before submitting PRs to `fewtarius/CachyLLama`, the host-ram bugfix (`2cac39964`) and the `make sync` tweak (`d56cb4583`) are the smallest, most-concrete candidates — they'd reduce the rebase conflict surface with zero downside. The SSD hardening and multimodal guards are more invasive and should be submitted as a coherent set when time permits.
+The canonical port has been verified with a full Release build, CPU-only and UI-disabled configurations, the full CTest suite, and `test-backend-ops` (18,844/18,844). Future canonical updates should be performed on `canonical-port`, porting fork-only changes deliberately, then reviewed before updating `master` or pushing a deployment.
 
 ---
 
