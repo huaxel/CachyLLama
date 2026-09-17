@@ -60,8 +60,8 @@ COMMON=(
     --repetitions 1
     --batch-size 2048
     --ubatch-size 512
-    --flash-attn
-    --no-mmap 0   # mmap on (the default, but be explicit)
+    --flash-attn on
+    --load-mode mmap   # mmap on (required for residency; --mmap is deprecated)
     -ngl 99       # offload all layers
     "${EXTRA_ARGS[@]}"
 )
@@ -94,10 +94,12 @@ done
 
 echo
 echo "### Decode (n=256)"
+# llama-bench has no -c flag: context is prompt + gen, so bench tg256
+# at a ctx-sized KV by prompting with (ctx - 256) tokens.
 for n in "${CTX_SIZES[@]}"; do
     echo
     echo "#### tg256 @ ctx=${n}"
-    "$BENCH" "${COMMON[@]}" -p 0 -n "${DECODE_TOKENS}" -c "${n}"
+    "$BENCH" "${COMMON[@]}" -p "$((n - DECODE_TOKENS))" -n "${DECODE_TOKENS}"
 done
 
 echo
@@ -106,6 +108,6 @@ echo "- If the MoE residency layer is enabled, check the per-decode log"
 echo "  for 'policy_hit_rate' and 'madvise: ... einval=N'."
 echo "- advice_einval > 0 means the kernel rejected the madvise call and"
 echo "  the policy is not doing anything."
-echo "- For physical residency verification, re-run with"
-echo "  '--moe-residency-debug on' and compare the aggregate ratio to"
-echo "  policy_hit_rate."
+echo "- For physical residency verification, re-run the workload with"
+echo "  'llama-cli --moe-residency-debug on' (llama-bench does not accept"
+echo "  the flag) and compare the aggregate ratio to policy_hit_rate."
