@@ -481,6 +481,17 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     }
 }
 
+// Sanitize a router model name for use as a single filesystem path component:
+// keep alphanumerics, dot, underscore, and hyphen; map anything else to '_' so
+// a model name cannot escape the SSD cache root.
+static std::string sanitize_model_name_for_path(const std::string & name) {
+    std::string out;
+    out.reserve(name.size());
+    for (const char c : name) {
+        out += (std::isalnum((unsigned char) c) || c == '.' || c == '_' || c == '-') ? c : '_';
+    }
+    return out;
+}
 #ifdef _WIN32
 static std::string wide_to_utf8(const wchar_t * ws) {
     if (!ws || !*ws) {
@@ -530,6 +541,33 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  CHILD_ADDR);
     preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
     preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
+
+    // Router mode: give every worker its own SSD cache root. Directories below
+    // the root are keyed only by conversation/user hash, never by model, and
+    // each worker allocates checkpoint IDs independently, so two models
+    // sharing one root overwrite each other's ckpt-N.bin and index.bin as
+    // soon as they serve the same user_id or the same conversation hash. The
+    // overwrite is silent: the losing model's checkpoints are gone and it
+    // just sees a clean miss. Namespace the root per model. Single-model
+    // (non-router) servers never render args this way and keep the exact
+    // path the operator passed.
+    std::string ssd_path;
+    if (preset.get_option("LLAMA_ARG_CACHE_SSD", ssd_path) && !ssd_path.empty()) {
+        const std::string sub         = sanitize_model_name_for_path(name);
+        const std::string suffix      = "/" + sub;
+        const bool already_namespaced = !sub.empty() && ssd_path.size() >= suffix.size() &&
+                                        ssd_path.compare(ssd_path.size() - suffix.size(), suffix.size(), suffix) == 0;
+        if (!sub.empty() && !already_namespaced) {
+            std::string namespaced = ssd_path;
+            if (namespaced.back() != '/') {
+                namespaced += '/';
+            }
+            namespaced += sub;
+            SRV_INF("router: SSD cache root for model '%s' namespaced to %s\n", name.c_str(), namespaced.c_str());
+            preset.set_option(ctx_preset, "LLAMA_ARG_CACHE_SSD", namespaced);
+        }
+    }
+
     // TODO: maybe validate preset before rendering ?
     // render args
     args = preset.to_args(bin_path);
