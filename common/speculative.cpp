@@ -325,7 +325,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
-            batch.add(dp.id_last, dp.pos0, seq_id, true);
+            batch.add(dp.id_last, dp.n_past, seq_id, true);
         }
 
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
@@ -384,7 +384,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                     continue;
                 }
 
-                batch.add(id, dp.pos0 + i + 1, seq_id, true);
+                batch.add(id, dp.n_past + i + 1, seq_id, true);
             }
 
             if (batch.size() == 0) {
@@ -1216,7 +1216,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             common_sampler_reset(smpls[seq_id].get());
 
-            const int32_t n = (int32_t) dp.pos0;
+            const int32_t n = (int32_t) dp.n_past;
 
             const int32_t n_draft = params.n_max;
 
@@ -1640,7 +1640,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
-            const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+            const int32_t idx = batch.add(dp.id_last, dp.n_past, seq_id, true);
             batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
             i_last[seq_id] = idx;
@@ -1654,16 +1654,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
-            // KV is per layer. process() filled this layer's KV only for positions < pos0
+            // KV is per layer. process() filled this layer's KV only for positions < n_past
             // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
-            // draft region (the seq_rm lower bound is pos0, leaving the prompt KV intact)
+            // draft region (the seq_rm lower bound is n_past, leaving the prompt KV intact)
             // and select head i so it rebuilds its own layer's KV there; decoding just the
             // latest token would leave its attention reading cells only another head wrote.
             if (chain_heads) {
                 auto * mem_dft = llama_get_memory(ctx_dft);
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (drafting[seq_id]) {
-                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].pos0, -1);
+                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].n_past, -1);
                     }
                 }
                 llama_set_nextn_layer_offset(ctx_dft, i);
@@ -1729,18 +1729,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     const int n_rows = (int) result.size() + 1; // id_last + tokens drafted so far
                     for (int t = 0; t < n_rows; ++t) {
                         const llama_token tok = (t == 0) ? dp.id_last : result[t - 1];
-                        const int32_t idx = batch.add(tok, dp.pos0 + t, seq_id, t == n_rows - 1);
+                        const int32_t idx = batch.add(tok, dp.n_past + t, seq_id, t == n_rows - 1);
                         batch.set_embd(idx, { chain_h[seq_id].data() + (size_t) t * n_embd, 1, (size_t) n_embd });
                         i_last[seq_id] = idx;
                     }
                 } else if (is_mem_shared) {
                     // note: with shared memory (e.g. Gemma4 assistants) we use the same position for all draft tokens
                     // ref: https://github.com/huggingface/transformers/blob/effde20942e3f82a1b97449f60b3a48c5ff96145/docs/source/en/model_doc/gemma4_assistant.md?plain=1#L36-L37
-                    const int32_t idx = batch.add(id, dp.pos0, seq_id, true);
+                    const int32_t idx = batch.add(id, dp.n_past, seq_id, true);
                     batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
                     i_last[seq_id] = idx;
                 } else {
-                    const int32_t idx = batch.add(id, dp.pos0 + i + 1, seq_id, true);
+                    const int32_t idx = batch.add(id, dp.n_past + i + 1, seq_id, true);
                     batch.set_embd(idx, { h_row, 1, (size_t) n_embd });
                     i_last[seq_id] = idx;
                 }
