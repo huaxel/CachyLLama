@@ -236,6 +236,25 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
 
+        // Optional attention output gate (Laguna drafters). Per-head or
+        // per-element, distinguished by the stored width, same as the Laguna
+        // target arch. Absent on generic DFlash drafters.
+        if (decoder_laguna) {
+            const ggml_tensor * gate_meta = ml->get_tensor_meta(
+                tn(LLM_TENSOR_ATTN_GATE, "weight", i).str().c_str());
+            if (gate_meta != nullptr) {
+                const int64_t n_gate_out = gate_meta->ne[1];
+                if (n_gate_out != n_head && n_gate_out != n_embd_head_k * n_head) {
+                    GGML_ABORT("DFlash: unexpected attention gate width %lld at layer %d "
+                            "(expected %lld per-head or %lld per-element)",
+                            (long long) n_gate_out, i, (long long) n_head,
+                            (long long) (n_embd_head_k * n_head));
+                }
+                layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i),
+                        { n_embd, n_gate_out }, 0);
+            }
+        }
+
         // optional per-head attention sinks (e.g. Nemotron DSpark)
         layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), { n_head }, TENSOR_NOT_REQUIRED);
 
@@ -585,7 +604,6 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -621,26 +639,32 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+        const auto & model_df = static_cast<const llama_model_dflash &>(model);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_input(inp->embd);
 
-        ggml_tensor * inp_target = inp->embd;
-        cb(inp_target, "inp_target_features", -1);
+        ggml_tensor * inp_g = inp->embd;
+        cb(inp_g, "inp_g_embeddings", -1);
 
         res->add_input(std::move(inp));
-
-        // fuse the target features through the encoder
-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
-        inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
-        cb(inp_g, "inp_g_embeddings", -1);
 
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g, layer.wv_s);
+            // Laguna draft layers project context K/V from the input_layernorm
+            // output, matching the query path (generic DFlash projects raw).
+            ggml_tensor * kv_inp = inp_g;
+            if (model_df.decoder_laguna) {
+                kv_inp = build_norm(inp_g, layer.attn_norm, NULL, LLM_NORM_RMS, il);
+                cb(kv_inp, "kv_inp_normed", il);
+            }
+
+            // NVFP4 scales (upstream #28000): pass to build_lora_mm for per-row dequant.
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, kv_inp, layer.wk_s);
+            ggml_tensor * Vcur = build_lora_mm(layer.wv, kv_inp, layer.wv_s);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -742,11 +766,33 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         // cache-aware, non-causal attention
         // With a gate present, o_proj is deferred until after gating.
         const bool    gated = layer.wqkv_gate != nullptr;
-        ggml_tensor * wo    = gated ? NULL : layer.wo;
+        ggml_tensor * wo    = gated ? nullptr : layer.wo;
 
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, wo,      NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      wo,      NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+
+        if (gated) {
+            // Softplus output gate on the pre-attention hidden state, per-head
+            // (broadcast over head_dim) or per-element -- same as the Laguna
+            // target arch.
+            ggml_tensor * gate = build_lora_mm(layer.wqkv_gate, noise_norm);
+            gate = ggml_softplus(ctx0, gate);
+            cb(gate, "attn_gate_softplus", il);
+
+            const int64_t n_tok = cur->ne[1];
+            if (layer.wqkv_gate->ne[1] == n_head) {
+                cur  = ggml_reshape_3d(ctx0, cur,  n_embd_head, n_head, n_tok);
+                gate = ggml_reshape_3d(ctx0, gate, 1,           n_head, n_tok);
+                cur  = ggml_mul(ctx0, cur, gate);
+                cur  = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tok);
+            } else {
+                cur = ggml_mul(ctx0, cur, gate);
+            }
+            cb(cur, "attn_gated", il);
+
+            cur = build_lora_mm(layer.wo, cur);
+        }
 
         if (attn_dynamic) {
             cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
