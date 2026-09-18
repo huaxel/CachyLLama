@@ -14741,8 +14741,15 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
 }
 
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
-    GGML_ASSERT(device < (int) vk_instance.device_indices.size());
-    GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
+    *free = 0;
+    *total = 0;
+
+    if (device < 0 || device >= (int) vk_instance.device_indices.size() ||
+        device >= (int) vk_instance.device_supports_membudget.size()) {
+        GGML_LOG_ERROR("ggml_vulkan: device %d is no longer available for memory query (%zu devices visible)\n",
+                        device, vk_instance.device_indices.size());
+        return;
+    }
 
     vk::PhysicalDevice vkdev = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgetprops;
@@ -14754,9 +14761,6 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
         memprops.pNext = &budgetprops;
     }
     vkdev.getMemoryProperties2(&memprops);
-
-    *total = 0;
-    *free = 0;
 
     for (uint32_t i = 0; i < memprops.memoryProperties.memoryHeapCount; ++i) {
         const vk::MemoryHeap & heap = memprops.memoryProperties.memoryHeaps[i];
