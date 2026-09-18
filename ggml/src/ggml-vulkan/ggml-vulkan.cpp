@@ -311,6 +311,11 @@ bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor * src1
 }
 static bool vk_instance_initialized = false;
 
+// Serializes ggml_vk_instance_init: the initialized flag is set right after
+// createInstance, before device_indices is populated, so a concurrent caller
+// would proceed with an empty device list and trip the device-index asserts.
+static std::mutex vk_instance_init_mutex;
+
 vk_instance_t vk_instance;
 
 static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context * ctx, const vk_buffer &buf, const VkDeviceSize offset) {
@@ -4911,6 +4916,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher() {
 }
 
 void ggml_vk_instance_init() {
+    std::lock_guard<std::mutex> lock(vk_instance_init_mutex);
     if (vk_instance_initialized) {
         return;
     }
