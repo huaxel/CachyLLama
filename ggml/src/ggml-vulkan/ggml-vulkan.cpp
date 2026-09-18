@@ -14697,6 +14697,18 @@ static ggml_guid_t ggml_backend_vk_guid() {
 ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
     VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
 
+    ggml_vk_instance_init();
+
+    // The device list can be empty even after a completed enumeration (e.g.
+    // transient driver state leaves the loader handing the application zero
+    // physical devices). Returning a null backend lets callers fall back or
+    // fail their own load cleanly instead of aborting the process here.
+    if (dev_num >= vk_instance.device_indices.size()) {
+        GGML_LOG_ERROR("ggml_vulkan: no usable Vulkan device at index %zu (%zu devices visible) - returning null backend\n",
+                        dev_num, vk_instance.device_indices.size());
+        return nullptr;
+    }
+
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
     ggml_vk_init(ctx, dev_num);
 
