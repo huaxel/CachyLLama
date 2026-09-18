@@ -26,8 +26,8 @@ CachyLLama diverges from `upstream/master` by carrying third-party work. Re-eval
 | FA top-K selection shader | Nathanw1014 carry | Not upstreamed | `flash_attn_top_k.comp` for DeepSeek sparse FA |
 | GATED_LINEAR_ATTN | Nathanw1014 carry | Not upstreamed | Implements `GGML_OP_GATED_LINEAR_ATTN` for gated linear attention |
 | DeepSeek-V4 hyper-connection fused ops | [ggml-org/llama.cpp#26578](https://github.com/ggml-org/llama.cpp/pull/26578) | **Merged upstream** | Three shaders: `dsv4_hc_{pre,comb,post}.comp`. HC hardcoded to 4. Tunable with `GGML_VK_DISABLE_DSV4_HC[_COMB\|_PRE\|_POST]=1`. Measured: prefill +16.4%, decode +41.1% on DSV4-Flash IQ3_XXS, Nimo |
-| DeepSeek-V4 Lightning Indexer | CachyLLama original | Not upstreamed | `lightning_indexer.comp`, `lightning_indexer_cm.comp`, `lightning_indexer_decode_cm.comp`. See [vulkan-init-order.md](vulkan-init-order.md) |
-| DSV4 sparse FA gather-to-compact | CachyLLama original | Not upstreamed | Sparse top-k FA for DeepSeek V4 CSA shape. `flash_attn_top_k.comp` |
+| DeepSeek-V4 Lightning Indexer | CachyLLama original plus upstream #27453 | **Upstream added** as `cb300598d`; local coopmat and decode extensions remain | Upstream provides the base `lightning_indexer.comp`; CachyLLama carries `lightning_indexer_cm.comp` and `lightning_indexer_decode_cm.comp`. See [vulkan-init-order.md](vulkan-init-order.md) |
+| DSV4 sparse FA gather-to-compact | CachyLLama original plus upstream #28105 | **Upstream added** generic sparse FA as `fc82583e6`; DeepSeek-specific top-K selection remains local | Sparse top-k FA for DeepSeek V4 CSA shape in `flash_attn_top_k.comp` |
 | FA flash-attn mask optimization | Nathanw1014 carry | Not upstreamed | `flash_attn_mask_opt.comp` for optimized attention mask handling |
 | FA MMQ funcs shader | Nathanw1014 carry | Not upstreamed | `flash_attn_mmq_funcs.glsl` shared code for MMQ-based FA |
 | Keep DeepSeek lightning-indexer K cache f16 | Nathanw1014 carry | Not upstreamed | Forces f16 key cache under quantized `-ctk` for Lightning Indexer correctness |
