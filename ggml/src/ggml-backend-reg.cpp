@@ -478,11 +478,15 @@ static fs::path backend_filename_extension() {
 }
 
 static ggml_backend_reg_t ggml_backend_load_best(const char * name, bool silent, const char * user_search_path) {
-    // Do not load a second copy when this backend is already linked into the
-    // process. Separate copies of a backend library have separate global state;
-    // for Vulkan that can invalidate the instance owned by the linked copy.
-    if (ggml_backend_reg_t existing = ggml_backend_reg_by_name(name)) {
-        return existing;
+    // Do not load a second copy during the default scan when this backend is
+    // already linked into the process. Separate copies of a backend library
+    // have separate global state; for Vulkan that can invalidate the instance
+    // owned by the linked copy. An explicit search path still requests an
+    // override and must be allowed to load it.
+    if (user_search_path == nullptr) {
+        if (ggml_backend_reg_t existing = ggml_backend_reg_by_name(name)) {
+            return existing;
+        }
     }
 
     // enumerate all the files that match [lib]ggml-name-*.[so|dll] in the search paths
