@@ -417,6 +417,24 @@ device CPU (usually due to missing support)
 Nimo (Strix Halo, gfx1151, Vulkan 1.4, RADV Mesa 26.2) with DeepSeek-V4-Flash
 IQ3_XXS — the warning is gone and the 15k-token prefill runs at 135-150 t/s.
 
+## Linked backend duplication guard
+
+The router executable links the Vulkan backend from the build tree, while
+`ggml_backend_load_all()` also scans the executable directory for dynamic
+backends. If deployment leaves a second `libggml-vulkan.so` there, the loader
+can load two copies of the backend. Their process-global Vulkan state is not
+shared; the duplicate can leave the linked copy with an invalid `VkInstance`
+and produce:
+
+```
+[Vulkan Loader] ERROR: vkEnumeratePhysicalDevices: Invalid instance
+```
+
+`ggml_backend_load_best()` must return an already-registered backend during the
+default scan. Explicit `ggml_backend_load_all_from_path()` calls remain
+allowed to load an override. Keep this guard when changing backend discovery
+or deployment layout.
+
 ---
 
 ## Patch-set table
