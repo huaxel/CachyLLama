@@ -15,19 +15,19 @@ CachyLLama diverges from `upstream/master` by carrying third-party work. Re-eval
 | Coopmat1 FA P-fragment hoist | Nathanw1014 carry | Not upstreamed | Hoists the P-fragment load out of the `hsv_tile` loop. Measured +5% on Qwen3.6-35B-A3B prefill, Strix Halo |
 | Coopmat1 FA Psh query-major | Nathanw1014 carry | Not upstreamed | Stores `Psh` query-major so the GEMM2 A load vectorizes |
 | 32-wide subgroup pinning (coopmat1 FA) | Nathanw1014 carry | Not upstreamed | Pins `required_subgroup_size=32` where narrowing is free on RDNA3 wave64 |
-| Bound command buffers by memory traffic | Nathanw1014 carry | Not upstreamed | Replaces flops-based ceiling with memory-traffic-based ceiling for UMA fairness |
-| Concat transpose shader | Nathanw1014 carry | Not upstreamed | `concat_transpose.comp` for delta-net dim-0 concat. Env-gated via `GGML_VK_CONCAT_TRANSPOSE` (default ON) |
-| MMID row-list prepass | Nathanw1014 carry | Not upstreamed | `mmid_row_lists.comp` for grouped-GEMM redesign. Stage 1 of 2 |
-| MMID f16-B probe | Nathanw1014 carry | Not upstreamed | Env-gated via `GGML_VK_MMID_F16B=1` (default off) |
-| MMID wave32 probe | Nathanw1014 carry | Not upstreamed | Env-gated via `GGML_VK_MMID_WAVE32=1` (default off) |
-| MMID scale cache (q5_K, q4_K, superblock-amortized) | Nathanw1014 carry | Not upstreamed | Shared-memory scale cache for mul_mat_id |
+| Bound command buffers by memory traffic | Nathanw1014 carry | **Dormant / not wired** | The canonical build still uses a fixed 100-node default; no memory-traffic bound is active |
+| Concat transpose shader | Nathanw1014 carry | **Dormant / not wired** | `concat_transpose.comp` remains in the tree, but has no generator, pipeline, dispatch, or active `GGML_VK_CONCAT_TRANSPOSE` control |
+| MMID row-list prepass | Nathanw1014 carry | **Dormant / not wired** | `mmid_row_lists.comp` and its loader helper remain in the tree, but no prepass pipeline or dispatch is registered |
+| MMID f16-B probe | Nathanw1014 carry | **Dormant / not wired** | No `GGML_VK_MMID_F16B` control or active probe remains in the canonical build |
+| MMID wave32 probe | Nathanw1014 carry | **Dormant / not wired** | No `GGML_VK_MMID_WAVE32` control or active probe remains in the canonical build |
+| MMID scale cache (q5_K, q4_K, superblock-amortized) | Nathanw1014 carry | **Dormant / not wired** | No active shared-memory scale-cache implementation remains in the canonical MMID path |
 | FA MMQ dot product fp32 scaling | Nathanw1014 carry | Not upstreamed | Scales the MMQ dot product in fp32 before narrowing for numerical stability |
 | FA split-K reduce shader | Nathanw1014 carry | **Upstream added** | `flash_attn_split_k_reduce.comp` is present upstream; no remaining CachyLLama-only shader delta |
-| FA top-K selection shader | Nathanw1014 carry | Not upstreamed | `flash_attn_top_k.comp` for DeepSeek sparse FA |
+| FA top-K selection shader | Nathanw1014 carry | **Dormant / not wired** | `flash_attn_top_k.comp` remains in the tree, but the active sparse path uses upstream compacting and has no top-K pipeline registration |
 | GATED_LINEAR_ATTN | Nathanw1014 carry | **Upstream added** as `f26efa02a` | Vulkan `GGML_OP_GATED_LINEAR_ATTN` support is now upstream in `gla.comp`; no remaining CachyLLama-only shader delta |
 | DeepSeek-V4 hyper-connection fused ops | [ggml-org/llama.cpp#26578](https://github.com/ggml-org/llama.cpp/pull/26578) | **Merged upstream** | Three shaders: `dsv4_hc_{pre,comb,post}.comp`. HC hardcoded to 4. Tunable with `GGML_VK_DISABLE_DSV4_HC[_COMB\|_PRE\|_POST]=1`. Measured: prefill +16.4%, decode +41.1% on DSV4-Flash IQ3_XXS, Nimo |
-| DeepSeek-V4 Lightning Indexer | CachyLLama original plus upstream #27453 | **Upstream added** as `cb300598d`; local coopmat and decode extensions remain | Upstream provides the base `lightning_indexer.comp`; CachyLLama carries `lightning_indexer_cm.comp` and `lightning_indexer_decode_cm.comp`. See [vulkan-init-order.md](vulkan-init-order.md) |
-| DSV4 sparse FA gather-to-compact | CachyLLama original plus upstream #28105 | **Upstream added** generic sparse FA as `fc82583e6`; DeepSeek-specific top-K selection remains local | Sparse top-k FA for DeepSeek V4 CSA shape in `flash_attn_top_k.comp` |
+| DeepSeek-V4 Lightning Indexer | CachyLLama original plus upstream #27453 | **Upstream added** as `cb300598d`; local extensions are dormant | Upstream provides the active base `lightning_indexer.comp`; `lightning_indexer_cm.comp` and `lightning_indexer_decode_cm.comp` remain unregistered in the canonical build. See [vulkan-init-order.md](vulkan-init-order.md) |
+| DSV4 sparse FA gather-to-compact | CachyLLama original plus upstream #28105 | **Upstream added** generic sparse FA as `fc82583e6`; local top-K variant is dormant | The active sparse path uses upstream compaction; `flash_attn_top_k.comp` remains unregistered |
 | FA flash-attn mask optimization | Nathanw1014 carry | **Upstream added** | `flash_attn_mask_opt.comp` is present upstream; no remaining CachyLLama-only shader delta |
 | FA MMQ funcs shader | Nathanw1014 carry | **Upstream added** | `flash_attn_mmq_funcs.glsl` is present upstream; no remaining CachyLLama-only shader delta |
 | Keep DeepSeek lightning-indexer K cache f16 | Nathanw1014 carry | Not upstreamed | Forces f16 key cache under quantized `-ctk` for Lightning Indexer correctness |
