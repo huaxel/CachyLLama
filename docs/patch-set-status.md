@@ -22,14 +22,14 @@ CachyLLama diverges from `upstream/master` by carrying third-party work. Re-eval
 | MMID wave32 probe | Nathanw1014 carry | Not upstreamed | Env-gated via `GGML_VK_MMID_WAVE32=1` (default off) |
 | MMID scale cache (q5_K, q4_K, superblock-amortized) | Nathanw1014 carry | Not upstreamed | Shared-memory scale cache for mul_mat_id |
 | FA MMQ dot product fp32 scaling | Nathanw1014 carry | Not upstreamed | Scales the MMQ dot product in fp32 before narrowing for numerical stability |
-| FA split-K reduce shader | Nathanw1014 carry | Not upstreamed | `flash_attn_split_k_reduce.comp` for split-K FA on large prompts |
+| FA split-K reduce shader | Nathanw1014 carry | **Upstream added** | `flash_attn_split_k_reduce.comp` is present upstream; no remaining CachyLLama-only shader delta |
 | FA top-K selection shader | Nathanw1014 carry | Not upstreamed | `flash_attn_top_k.comp` for DeepSeek sparse FA |
-| GATED_LINEAR_ATTN | Nathanw1014 carry | Not upstreamed | Implements `GGML_OP_GATED_LINEAR_ATTN` for gated linear attention |
+| GATED_LINEAR_ATTN | Nathanw1014 carry | **Upstream added** as `f26efa02a` | Vulkan `GGML_OP_GATED_LINEAR_ATTN` support is now upstream in `gla.comp`; no remaining CachyLLama-only shader delta |
 | DeepSeek-V4 hyper-connection fused ops | [ggml-org/llama.cpp#26578](https://github.com/ggml-org/llama.cpp/pull/26578) | **Merged upstream** | Three shaders: `dsv4_hc_{pre,comb,post}.comp`. HC hardcoded to 4. Tunable with `GGML_VK_DISABLE_DSV4_HC[_COMB\|_PRE\|_POST]=1`. Measured: prefill +16.4%, decode +41.1% on DSV4-Flash IQ3_XXS, Nimo |
 | DeepSeek-V4 Lightning Indexer | CachyLLama original plus upstream #27453 | **Upstream added** as `cb300598d`; local coopmat and decode extensions remain | Upstream provides the base `lightning_indexer.comp`; CachyLLama carries `lightning_indexer_cm.comp` and `lightning_indexer_decode_cm.comp`. See [vulkan-init-order.md](vulkan-init-order.md) |
 | DSV4 sparse FA gather-to-compact | CachyLLama original plus upstream #28105 | **Upstream added** generic sparse FA as `fc82583e6`; DeepSeek-specific top-K selection remains local | Sparse top-k FA for DeepSeek V4 CSA shape in `flash_attn_top_k.comp` |
-| FA flash-attn mask optimization | Nathanw1014 carry | Not upstreamed | `flash_attn_mask_opt.comp` for optimized attention mask handling |
-| FA MMQ funcs shader | Nathanw1014 carry | Not upstreamed | `flash_attn_mmq_funcs.glsl` shared code for MMQ-based FA |
+| FA flash-attn mask optimization | Nathanw1014 carry | **Upstream added** | `flash_attn_mask_opt.comp` is present upstream; no remaining CachyLLama-only shader delta |
+| FA MMQ funcs shader | Nathanw1014 carry | **Upstream added** | `flash_attn_mmq_funcs.glsl` is present upstream; no remaining CachyLLama-only shader delta |
 | Keep DeepSeek lightning-indexer K cache f16 | Nathanw1014 carry | Not upstreamed | Forces f16 key cache under quantized `-ctk` for Lightning Indexer correctness |
 | Vulkan APU `nodes_per_submit` auto-lower | CachyLLama original | Not upstreamed (`ggml-vulkan.cpp` still hardcodes 100) | Defaults to 8 on UMA, 100 on discrete. `GGML_VK_NODES_PER_SUBMIT=N` override |
 | Strix Halo RDNA3.5 tuning (ROCm/HIP) | gaetan-puleo carry | Upstream added `mmq-config-rdna3-5.cuh`; CachyLLama's has Strix Halo-specific tuning | `I = 64` in all MMQ CASE entries for upstream `#24127` `static_assert((I_) % 32 == 0)` |
