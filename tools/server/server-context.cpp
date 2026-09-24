@@ -2911,7 +2911,9 @@ private:
         // still filters by pos_min / pos_max and applies its own n_swa > 0 check;
         // reverse iteration (rbegin/rend) picks the newest qualifying entry, so
         // insertion-order insertion doesn't affect which checkpoint is selected.
-        const int id_task = slot.task->id;
+        // a slot restore (SERVER_TASK_TYPE_SLOT_RESTORE with no .ckpt sidecar)
+        // calls this outside any task, so slot.task is null there
+        const int id_task = slot.task ? slot.task->id : -1;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
