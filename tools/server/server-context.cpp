@@ -2919,7 +2919,9 @@ private:
         // still filters by pos_min / pos_max and applies its own n_swa > 0 check;
         // reverse iteration (rbegin/rend) picks the newest qualifying entry, so
         // insertion-order insertion doesn't affect which checkpoint is selected.
-        const int id_task = slot.task->id;
+        // a slot restore (SERVER_TASK_TYPE_SLOT_RESTORE with no .ckpt sidecar)
+        // calls this outside any task, so slot.task is null there
+        const int id_task = slot.task ? slot.task->id : -1;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -4607,7 +4609,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min <= pos_min_thold) {
+                                if (pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4780,25 +4782,23 @@ private:
                             }
 
                             {
-                                // Erase checkpoints whose pos_max is past pos_next.
-                                //
-                                // Exception: deferred-final snapshots (pos_min == 0)
-                                // are baked from a known-good state at end-of-prompt.
-                                // SWA invalidation should not erase them on every turn
-                                // because they were valid at capture time, and the load
-                                // predicate below already filters out checkpoints that
-                                // no longer cover pos_next (n_swa > 0 && cur.pos_max >
-                                // pos_next in the acceptance loop).
-                                //
-                                // Without this guard, the SWA step would erase every
-                                // older deferred final, defeating the ring buffer
-                                // (P1) and the auto-scaled checkpoint count (P2).
-                                // Both checkpoints shrink to a stale pair and the
-                                // ring buffer never accumulates past 2 entries.
+                                // Erase checkpoints whose pos_max is past pos_next,
+                                // deferred finals (pos_min == 0) included, as upstream
+                                // does. A checkpoint that extends past the point where
+                                // this prompt diverges holds state for tokens that are
+                                // no longer in the slot, and slot.prompt.tokens is about
+                                // to be cut to the new branch, so nothing can ever match
+                                // it again. Keeping such finals (as this fork used to)
+                                // only filled the ring with dead branches: after 32
+                                // requests sharing a long prefix and differing at the
+                                // end, the one checkpoint they all need -- the end of
+                                // the shared prefix -- was the oldest and got recycled,
+                                // and every later request re-read the whole prompt.
+                                // A final on the current branch still survives, because
+                                // a prompt that extends it does not diverge before it.
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    const bool deferred_final_snapshot = (cur.pos_min == 0);
-                                    if (!deferred_final_snapshot && cur.pos_max > pos_next) {
+                                    if (cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
