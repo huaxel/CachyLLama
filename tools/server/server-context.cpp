@@ -231,6 +231,8 @@ struct server_slot {
     // set when this slot's KV state came from an SSD cold-start restore;
     // downstream paths must not assume a fully validated in-memory state
     bool ssd_cold_start_used = false;
+    // create final checkpoint after first token (ported from pre-rebase tree)
+    bool deferred_final_checkpoint = false;
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -2586,6 +2588,216 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    size_t _ckpt_memory_budget() const {
+        const size_t default_limit = (size_t)2 * 1024 * 1024 * 1024;  // 2 GiB floor
+        if (params_base.n_ctx_checkpoints <= 0) return default_limit;
+        // 400 MiB per configured checkpoint = 200 MiB working set * 2 headroom.
+        const size_t per = (size_t)params_base.n_ctx_checkpoints * 400 * 1024 * 1024;
+        return std::max(default_limit, per);
+    }
+
+    // Deferred final checkpoint: captures full prompt state after the last
+    // batch was processed and the first generation token has been sent.
+    // Ported from the pre-rebase tree (dropped when the completion flow was
+    // refactored); adapted to current names. The SWA-skip guard in
+    // get_available() was not ported (no SWA models in test scope).
+    void deferred_create_final_checkpoint(server_slot & slot) {
+        if (params_base.n_ctx_checkpoints <= 0) return;
+        if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION) return;
+
+        // Use prompt positions, not generation positions.
+        // The generation positions (done_pos_min/done_pos_max) extend past
+        // the prompt end and cause stale positions to persist after restore,
+        // triggering "Invalid input batch" on the next turn (issue #8).
+        // CRITICAL: Use slot.prompt.n_tokens() - slot.stats.n_gen + 1 (actual
+        // prompt tokens processed) NOT slot.task->n_tokens() (which is the
+        // full task token count, including unprocessed conversation history)
+        // and NOT slot.prompt.n_tokens() alone (which includes generated
+        // tokens added since the deferred flag was set). At this point the
+        // first generation token has been sampled (n_decoded incremented)
+        // but NOT yet pushed to prompt.tokens (handle_last_sampled_token
+        // runs after the sampling loop, not inside it). So:
+        //   prompt.tokens has N + (k-1) tokens for the k-th generation
+        //   n_decoded = k
+        //   prompt_n_tokens = (N + k - 1) - k + 1 = N  (the prompt boundary)
+        // Subtracting only n_decoded (without the +1) gave N - 1, which
+        // made pos_max cover positions [0, N-2] instead of [0, N-1] -- the
+        // last prompt token's KV cache entry was stripped from the checkpoint.
+        // On restore the model had to reprocess that 1 token every cold
+        // start, and f_keep/f_sim metrics were off by 1 token.
+        const int64_t prompt_n_tokens = slot.prompt.n_tokens() - slot.stats.n_gen + 1;
+        if (prompt_n_tokens < 64) return;
+
+        // Note: cold-start mid-prompts (create_checkpoint() emits one with
+        // pos_min==0 on a fresh slot, since pos_min_thold==0 with no prior
+        // context) intentionally share the (pos_min=0, pos_max=prompt_end)
+        // signature of a deferred final.  They're valid LCP snapshots at
+        // [0, batch_end] and consumed by the LCP acceptance predicate on
+        // future turns.  The SWA-skip guard in get_available() preserves
+        // them alongside real deferred finals, costing one of the N ring
+        // buffer slots per cold start.  That's correct -- not a bug.
+        //
+
+        // Deferred checkpoint always captures final state. Skip the proximity
+        // guard used for mid-prompt checkpoints — the deferred ckpt is never
+        // "too close" to a prior ckpt; it's the most complete snapshot.
+
+        // Ring buffer: when at capacity, overwrite the least-useful checkpoint
+        // in place instead of erasing+emplacing.  This preserves vector
+        // capacity (no reallocation churn), gives clean cycling checkpoint
+        // numbers (1..N, 1..N, ...), and avoids erase() invalidating iterators.
+        // Uses the same insertion-order policy as create_checkpoint(): drop the
+        // front (oldest by insertion order) and splice it to the back.
+        // See create_checkpoint's comment for why "evict highest pos_min"
+        // doesn't work once deferred finals survive across turns.
+        //
+        // Size-based memory budget (P3): evict largest first if total exceeds
+        // _ckpt_memory_budget(), before count-based eviction.
+        {
+            const size_t ckpt_mem_limit = _ckpt_memory_budget();
+            size_t total_ckpt_mem = 0;
+            for (const auto & c : slot.prompt.checkpoints) total_ckpt_mem += c.size();
+            while (ckpt_mem_limit > 0 && total_ckpt_mem > ckpt_mem_limit && slot.prompt.checkpoints.size() > 1) {
+                auto largest = slot.prompt.checkpoints.begin();
+                for (auto it = std::next(largest); it != slot.prompt.checkpoints.end(); ++it) {
+                    if (it->size() > largest->size()) largest = it;
+                }
+                total_ckpt_mem -= largest->size();
+                SLT_TRC(slot, "evicting checkpoint by memory budget (size = %.3f MiB, total = %.3f MiB, limit = %zu MiB)\n",
+                        (float)largest->size() / 1024 / 1024, (float)total_ckpt_mem / 1024 / 1024, ckpt_mem_limit / 1024 / 1024);
+                slot.prompt.checkpoints.erase(largest);
+            }
+        }
+
+        common_prompt_checkpoint * cur_ptr = nullptr;
+        bool recycled = false;
+        if (slot.prompt.checkpoints.size() >= (size_t)params_base.n_ctx_checkpoints) {
+            // Ring buffer recycle: move the FRONT (oldest by insertion order)
+            // to the BACK and clear it in place.  Splice preserves the std::list
+            // node (no allocation); clear() preserves the data vector capacity
+            // (no reallocation).  After this, the recycled entry is at the
+            // back and ready to be refilled below with today's snapshot.
+            //
+            // Why insertion order: deferred finals all carry pos_min == 0
+            // (the SWA-skip guard below preserves them across turns), so the
+            // old "evict highest pos_min" comparison always tied to 0 and
+            // picked begin() forever -- a single-slot FIFO with 15 dead
+            // entries.  Insertion order breaks the tie.
+            //
+            // Why splice+clear instead of pop_front+emplace_back: keeps the
+            // recycled entry's existing vector capacity instead of throwing
+            // it away.  For a server that's been running for hours, this
+            // avoids ~32 KB worth of reallocations on every checkpoint.
+            const auto & victim = slot.prompt.checkpoints.front();
+            SLT_INF(slot,
+                    "kv ring buffer, recycled (%zu/%d full, dropped pos_min=%d size=%.3f MiB)\n",
+                    slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
+                    victim.pos_min, (float)victim.size() / 1024 / 1024);
+            slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(),
+                                          slot.prompt.checkpoints,
+                                          slot.prompt.checkpoints.begin());
+            // The spliced node is now at the back.  clear() preserves capacity.
+            slot.prompt.checkpoints.back().clear();
+            recycled = true;
+        }
+        if (!recycled) {
+            cur_ptr = &slot.prompt.checkpoints.emplace_back();
+        } else {
+            cur_ptr = &slot.prompt.checkpoints.back();
+        }
+        auto & cur = *cur_ptr;
+
+        // Save prompt boundaries: pos_min=0 (start of prompt), pos_max=prompt_n_tokens-1 (end of prompt)
+        cur.update_pos(prompt_n_tokens, 0, (llama_pos)prompt_n_tokens - 1);
+
+        // The checkpoint metadata says n_tokens=prompt_n_tokens (prompt only),
+       // but update_tgt/update_dft save the FULL KV cache including generated
+       // token entries.  A metadata/data mismatch causes hallucination on
+       // restore: the model loads generated-token KV cache and attends to its
+       // own previous output.  Fix: temporarily strip generated-token entries
+       // from the live KV cache, save the prompt-only state, then restore the
+       // full KV cache so continued generation is unaffected.
+        {
+            // --- ctx_tgt (main model KV cache) ---
+            size_t full_size = llama_state_seq_get_size_ext(
+                ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            std::vector<uint8_t> full_state;
+            if (full_size > 0) {
+                full_state.resize(full_size);
+                llama_state_seq_get_data_ext(ctx_tgt, full_state.data(),
+                    full_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+
+            auto * mem_tgt = llama_get_memory(ctx_tgt);
+            if (mem_tgt) {
+                llama_memory_seq_rm_attn_only(
+                    mem_tgt, slot.id, (llama_pos)prompt_n_tokens, -1);
+            }
+
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+            if (!full_state.empty()) {
+                llama_state_seq_set_data_ext(ctx_tgt, full_state.data(),
+                    full_state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        }
+
+        // --- ctx_dft (draft/MTP model KV cache) ---
+        if (ctx_dft) {
+            size_t full_size = llama_state_seq_get_size_ext(
+                ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            std::vector<uint8_t> full_state;
+            if (full_size > 0) {
+                full_state.resize(full_size);
+                llama_state_seq_get_data_ext(ctx_dft, full_state.data(),
+                    full_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+
+            auto * mem_dft = llama_get_memory(ctx_dft);
+            if (mem_dft) {
+                llama_memory_seq_rm_attn_only(
+                    mem_dft, slot.id, (llama_pos)prompt_n_tokens, -1);
+            }
+
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+            if (!full_state.empty()) {
+                llama_state_seq_set_data_ext(ctx_dft, full_state.data(),
+                    full_state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        }
+
+        // Log the resulting entry.  The canonical "what just happened" message
+        // is the "recycled" or "pushed" final line above; this line confirms
+        // what was written into the (possibly recycled) back entry.
+        SLT_INF(slot,
+                "kv ring buffer, %s final checkpoint (%zu/%d full, pos_min=%d size=%.3f MiB)\n",
+                recycled ? "recycled" : "pushed",
+                slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
+                cur.pos_min, (float)cur.size() / 1024 / 1024);
+
+        // SSD-backed KV cache: store final checkpoint on disk. Ported from
+        // the pre-rebase tree; conv_hash is a content hash (no per-slot
+        // conversation hash in the current tree). 0 is the null bucket.
+        // Skipped for hybrid models: their restored recurrent state generates
+        // off-topic text (measured 2026-09-29), so storing 340 MiB per prompt
+        // buys nothing until hybrid restore is root-caused.
+        if (ssd_page_manager && !(model_tgt && llama_model_is_hybrid(model_tgt))) {
+            static const llama_tokens no_tokens;
+            const server_tokens & src = slot.task ? slot.task->tokens : slot.prompt.tokens;
+            const llama_tokens & prefix_tokens = src.has_mtmd ? no_tokens : src.get_tokens();
+            if (!prefix_tokens.empty()) {
+                uint64_t conv_hash = kv_ssd_hash_tokens((const uint32_t *)prefix_tokens.data(),
+                    std::min(prefix_tokens.size(), (size_t)1024));
+                if (conv_hash == 0) conv_hash = 1;
+                ssd_page_manager->store_checkpoint_with_tokens(
+                    slot.id, ctx_tgt, ctx_dft, cur, prefix_tokens.data(),
+                    prefix_tokens.size(), ssd_turn_counter, conv_hash,
+                    slot.task ? slot.task->user_id : std::string());
+            }
+        }
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
@@ -2654,18 +2866,22 @@ private:
         // pre-rebase tree, where this call lived next to the log line above;
         // the rebase dropped it when this block was refactored. Skip the
         // store outright on a media turn: an empty token run would otherwise
-        // land a 0-token checkpoint in the index. conv_hash is 0 (no per-slot
-        // conversation hash in the current tree); the manager routes to the
-        // anonymous bucket and user_id still scopes per-user caches.
-        if (ssd_page_manager) {
+        // land a 0-token checkpoint in the index. conv_hash is a content hash
+        // (no per-slot conversation hash in the current tree); 0 is the null
+        // bucket and is rejected, so it is never passed. Skipped for hybrid
+        // models (see above): unrestorable checkpoints are pure disk bloat.
+        if (ssd_page_manager && !(model_tgt && llama_model_is_hybrid(model_tgt))) {
             static const llama_tokens none;
             const auto & prefix_tokens = slot.prompt.tokens.has_mtmd ? none : slot.prompt.tokens.get_tokens();
             if (!prefix_tokens.empty()) {
+                uint64_t conv_hash = kv_ssd_hash_tokens((const uint32_t *)prefix_tokens.data(),
+                    std::min(prefix_tokens.size(), (size_t)1024));
+                if (conv_hash == 0) conv_hash = 1;
                 ssd_page_manager->store_checkpoint_with_tokens(
                     slot.id, ctx_tgt, ctx_dft, cur,
                     prefix_tokens.data(),
                     prefix_tokens.size(),
-                    ssd_turn_counter, 0,
+                    ssd_turn_counter, conv_hash,
                     slot.task ? slot.task->user_id : std::string());
             }
         }
@@ -3502,6 +3718,183 @@ private:
                         SLT_DBG(slot, "[PROBE] prefill-init n_past=0 slot.prompt=%zu ssd_page_manager=%d cache_prompt=%d\n",
                                 slot.prompt.tokens.size(), (int)(ssd_page_manager != nullptr), (int)slot.task->params.cache_prompt);
 
+                        // Must populate slot.prompt.tokens so get_common_prefix() finds the match.
+                        // Skipped for hybrid (SSM/recurrent) models: restored recurrent
+                        // state produces off-topic generations (measured 2026-09-29:
+                        // Qwen3.6-35B-A3B full-prefill on-topic vs SSD-restored
+                        // off-topic corpus text at temp 0; dense MiniCPM5-2B
+                        // restores bit-identically). model_tgt null also skips.
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager &&
+                                !(model_tgt && llama_model_is_hybrid(model_tgt))) {
+                            static const llama_tokens no_task_tokens;
+                            const auto & task_tokens = slot.task->tokens.has_mtmd
+                                ? no_task_tokens : slot.task->tokens.get_tokens();
+                            // Content hash routes to the per-conversation cache
+                            // (no per-slot conversation hash in the current
+                            // tree); 0 is the null bucket and is rejected.
+                            uint64_t task_conv_hash = 0;
+                            if (!task_tokens.empty()) {
+                                task_conv_hash = kv_ssd_hash_tokens(
+                                    (const uint32_t *)task_tokens.data(),
+                                    std::min(task_tokens.size(), (size_t)1024));
+                                if (task_conv_hash == 0) task_conv_hash = 1;
+                            }
+                            if (!task_tokens.empty()) {
+                                int32_t ssd_pos_min = 0, ssd_pos_max = 0;
+                                uint64_t ssd_n_tokens = 0;
+                                int32_t ssd_lcp = 0;
+                                float ssd_overlap = 0.0f;
+                                bool ssd_is_continuation = false;
+                                bool ssd_partial = false;
+                                std::vector<uint8_t> ssd_spec_data;
+                                if (ssd_page_manager->find_and_load_checkpoint(
+                                        task_tokens.data(), task_tokens.size(),
+                                        ssd_turn_counter, ctx_tgt, ctx_dft,
+                                        (uint32_t)slot.id,
+                                        ssd_pos_min, ssd_pos_max, ssd_n_tokens,
+                                        &ssd_spec_data,
+                                        task_conv_hash, 0, (uint64_t)task_tokens.size(),
+                                        &ssd_lcp, &ssd_overlap, &ssd_is_continuation,
+                                        &ssd_partial,
+                                        slot.task->user_id)) {
+                                    // Safety check: reject checkpoints that cover more tokens than
+                                    // the current task. This can happen if a deferred final
+                                    // checkpoint was created after the first generation token
+                                    // was added to the prompt (bug fixed in deferred_create_final_checkpoint
+                                    // to use slot.task->n_tokens()), or if a checkpoint from a
+                                    // longer conversation is incorrectly matched. Such checkpoints
+                                    // would restore generation state as prompt state, causing
+                                    // hallucination on cold start.
+                                    // For partial LCP matches (ssd_partial), the checkpoint can
+                                    // legitimately cover more tokens than the current task (agent
+                                    // trimmed middle tokens) — the caller caps n_past to the LCP.
+                                    if (ssd_n_tokens > task_tokens.size() && !ssd_partial) {
+                                        SLT_WRN(slot, "cold-start: rejecting SSD checkpoint (n_tokens=%lu > task_tokens=%zu) - checkpoint appears to contain generated tokens\n",
+                                                (unsigned long)ssd_n_tokens, task_tokens.size());
+                                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                        if (ctx_dft) {
+                                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, -1, -1);
+                                        }
+                                        n_past = 0;
+                                        slot.prompt.tokens.clear();
+                                        ssd_n_tokens = 0;
+                                    }
+
+                                    // Hybrid model LCP validation. Recurrent state is
+                                    // content-dependent - if the LCP is much smaller than
+                                    // the checkpoint's n_tokens, the recurrent state beyond
+                                    // the LCP is from a different conversation and will
+                                    // produce garbage logits (all -inf, sampler crash).
+                                    //
+                                    // Three cases:
+                                    //   1. lcp >= n_tokens: full coverage, recurrent state valid
+                                    //   2. lcp >= PREFIX_MAX (4096) AND overlap >= 99%:
+                                    //      same-conversation checkpoint with full prefix match
+                                    //   3. lcp < PREFIX_MAX: partial coverage, cap n_past to LCP
+                                    //
+                                    // For dense models the recurrent layer is replaced by full
+                                    // attention, so this gate is a no-op for them.
+                                    if (ssd_n_tokens > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS
+                                            && ssd_lcp > 0 && ssd_n_tokens > 0) {
+                                        const uint64_t validated_tokens = std::min(
+                                            ssd_n_tokens, (uint64_t)KV_SSD_TOKEN_PREFIX_MAX);
+                                        const float MIN_LCP_RATIO = 0.80f;
+                                        float lcp_ratio = (float)ssd_lcp / (float)validated_tokens;
+                                        // A partial LCP match (hash didn't match the full sequence)
+                                        // is never "full coverage" — the state beyond the LCP is
+                                        // from a different token sequence.
+                                        bool full_coverage = !ssd_partial && (
+                                            ssd_lcp >= (int32_t)ssd_n_tokens ||
+                                            (ssd_lcp >= (int32_t)KV_SSD_TOKEN_PREFIX_MAX
+                                             && ssd_overlap >= 0.99f));
+                                        if (!full_coverage && lcp_ratio < MIN_LCP_RATIO) {
+                                            SLT_WRN(slot, "cold-start: rejecting SSD checkpoint for hybrid model "
+                                                    "(lcp=%d < 80%% of validated=%lu/n_tokens=%lu, ratio=%.1f%%, overlap=%.1f%%)\n",
+                                                    ssd_lcp, (unsigned long)validated_tokens, (unsigned long)ssd_n_tokens,
+                                                    lcp_ratio * 100.0f, ssd_overlap * 100.0f);
+                                            // Clear the loaded state and reset
+                                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                            n_past = 0;
+                                            slot.prompt.tokens.clear();
+                                            ssd_n_tokens = 0;
+                                        } else if (!full_coverage) {
+                                            // Partial coverage: cap n_past to LCP so only
+                                            // validated recurrent state is used.
+                                            SLT_INF(slot, "SSD hybrid model partial-coverage: "
+                                                    "lcp=%d ssd_n_tokens=%lu cap to LCP\n",
+                                                    ssd_lcp, (unsigned long)ssd_n_tokens);
+                                            llama_memory_seq_rm_attn_only(
+                                                llama_get_memory(ctx_tgt), slot.id, ssd_lcp, -1);
+                                            // Attention state is only valid up to LCP for hybrid models
+                                            n_past = ssd_lcp;
+                                        }
+                                    }
+
+                                    // Partial LCP match (dense or hybrid): the restored state
+                                    // is only valid up to the LCP position. Strip stale
+                                    // attention KV beyond ssd_lcp and cap n_past.
+                                    // The hybrid model block above already does this for
+                                    // recurrent models; dense (non-SWA) models fall through
+                                    // here because seq_rm_attn_only == seq_rm for them.
+                                    if (ssd_partial && ssd_lcp > 0 && (uint64_t)ssd_lcp < ssd_n_tokens) {
+                                        SLT_INF(slot, "SSD cache partial-LCP restore: "
+                                                "lcp=%d ssd_n_tokens=%lu stripping post-LCP attention KV\n",
+                                                ssd_lcp, (unsigned long)ssd_n_tokens);
+                                        llama_memory_seq_rm_attn_only(
+                                            llama_get_memory(ctx_tgt), slot.id, ssd_lcp, -1);
+                                        n_past = ssd_lcp;
+                                    }
+
+                                    if (ssd_n_tokens > 0) {
+                                    // Push checkpoint's token count.
+                                    // ssd_lcp from find_match is capped at
+                                    // KV_SSD_TOKEN_PREFIX_MAX (4096), but
+                                    // same-conversation checkpoints match
+                                    // for all n_tokens. Use ssd_n_tokens
+                                    // directly for full coverage.
+                                    // For partial LCP matches, cap to ssd_lcp —
+                                    // only the validated prefix positions are
+                                    // safe to push.
+                                    int32_t n_push = (int32_t)std::min((uint64_t)task_tokens.size(), ssd_n_tokens);
+                                    if (ssd_partial) {
+                                        n_push = std::min(n_push, ssd_lcp);
+                                    }
+                                    for (int32_t i = 0; i < n_push; i++) {
+                                        slot.prompt.tokens.push_back(task_tokens[i]);
+                                    }
+                                    SLT_INF(slot, "SSD cache restore: lcp=%d ssd_n_tokens=%lu pos=[%d,%d] n_push=%d overlap=%.1f%% continuation=%d%s\n",
+                                            ssd_lcp, (unsigned long)ssd_n_tokens, ssd_pos_min, ssd_pos_max, n_push,
+                                            ssd_overlap * 100.0f, (int)ssd_is_continuation,
+                                            ssd_partial ? " (partial LCP)" : "");
+
+                                    // Create in-memory checkpoint so downstream
+                                    // checkpoint search finds it. pos_min=0
+                                    // triggers the cur.pos_min==0 match in
+                                    // the lambda. Empty data vectors mean
+                                    // load_tgt/load_dft are no-ops — the
+                                    // SSD restore already loaded full state.
+                                    auto & ckpt = slot.prompt.checkpoints.emplace_back();
+                                    ckpt.update_pos(n_push, 0, (llama_pos)n_push);
+
+                                    // Restore speculative impl state (pending_h for MTP)
+                                    // so the first draft after cold-start is consistent.
+                                    if (spec && !ssd_spec_data.empty()) {
+                                        common_speculative_set_state(spec.get(), slot.id, ssd_spec_data);
+                                    }
+
+                                    // Flag that SSD cache restored this slot.
+                                    slot.ssd_cold_start_used = true;
+                                    // For hybrid models with partial coverage, n_past was already set to ssd_lcp above.
+                                    // For dense models with partial LCP match, n_past was also set above.
+                                    // For full coverage (hybrid or dense, non-partial), set n_past to n_push.
+                                    if (n_past == 0) {
+                                        n_past = n_push;
+                                    }
+                                    } // ssd_n_tokens > 0 (not rejected by hybrid LCP check)
+                                }
+                            }
+                        }
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -4280,6 +4673,13 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
+                // Defer final checkpoint SSD I/O to after first token.
+                // The inline mid-prompt checkpoints were created during
+                // prompt processing; this final checkpoint captures the
+                // full prompt state after the last batch was processed,
+                // so warm restarts can skip nearly all prompt tokens.
+                slot.deferred_final_checkpoint = true;
+
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
@@ -4328,11 +4728,21 @@ private:
 
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
+                if (slot.deferred_final_checkpoint) {
+                    slot.deferred_final_checkpoint = false;
+                    deferred_create_final_checkpoint(slot);
+                }
                 slot.print_timings();
                 send_final_response(slot);
                 slot.release();
 
                 return;
+            }
+
+            // Defer final checkpoint after first token is sent.
+            if (slot.deferred_final_checkpoint) {
+                slot.deferred_final_checkpoint = false;
+                deferred_create_final_checkpoint(slot);
             }
 
             slot.print_timings_tg();
@@ -4453,6 +4863,10 @@ private:
                 slot.stats.n_gen += 1;
 
                 if (!process_token(result, slot)) {
+                    if (slot.deferred_final_checkpoint) {
+                        slot.deferred_final_checkpoint = false;
+                        deferred_create_final_checkpoint(slot);
+                    }
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();

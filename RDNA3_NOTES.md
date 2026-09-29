@@ -226,21 +226,36 @@ synthetic "noise @ low expert count" finding. No regression on a second
 architecture: default-on is safe everywhere measured (big win at 128
 experts, harmless elsewhere).
 
-### Server SSD-cache runtime validation (2026-09-29, Qwen3.6-35B-A3B, Vulkan)
+### Server SSD-cache runtime validation (2026-09-29, Qwen3.6-35B-A3B + MiniCPM5-2B, Vulkan)
 
 `llama-server` (Vulkan build) serves correctly with `--cache-ssd`:
 14k-token prefill + decode, health endpoint, graceful shutdown, zero
 errors. SSD manager + system cache initialize (dirs created).
 
-Two findings from the smoke test:
+Findings, in order:
 1. The rebase had dropped both `store_checkpoint_with_tokens` call sites
-   (the whole `deferred_create_final_checkpoint` mechanism is also gone
-   upstream-side). The mid-prompt store was restored next to the surviving
-   `create_checkpoint` log line, adapted to current names
-   (`ssd_page_manager`, no `slot.conv_hash` -> anonymous bucket).
-2. Stores still don't fire for this model, **by upstream design**: the
-   checkpoint gate requires FULL/RS/SWA removal, and this model reports
-   PARTIAL (`seq_rm=1`, measured live). No checkpoints -> no SSD writes,
-   identical to pre-rebase behavior. The SSD path engages for
-   FULL/RS-removal or SWA models. Deferred-final restoration remains
-   follow-up work (larger port against the refactored completion path).
+   (the whole `deferred_create_final_checkpoint` mechanism was gone too).
+   Both were ported back: mid-prompt store next to the surviving
+   `create_checkpoint` log line, plus the full deferred-final function
+   (flag, setter, 3 call sites, memory-budget helper), adapted to current
+   names (`ssd_page_manager`; content-hash conv_hash since `slot.conv_hash`
+   is gone; raw `ctx_dft`). A `conv_hash == 0` silent-skip in
+   `get_or_create_cache` bit once during debugging - never pass 0.
+2. Stores work: deferred-final wrote `ckpt-1.bin` (341 MiB, 14189 tokens)
+   and the index reloads across restarts (`next_id=2`).
+3. Dense restore is BIT-EXACT: MiniCPM5-2B same prompt/temp before and
+   after restart produced character-identical output (215/215 chars,
+   990/991 tokens served from SSD).
+4. Hybrid restore CORRUPTS output: Qwen3.6-35B-A3B same prompt/temp gave
+   on-topic thinking on full prefill but off-topic corpus text
+   (Chinese install instructions) from the SSD state - the recurrent
+   (Mamba) state doesn't survive the round trip. The old hybrid gate keys
+   on RS seq_rm type but this model reports PARTIAL (`seq_rm=1`, `n_rs=0`
+   measured live), so it slipped through. Stores AND restores are now
+   gated on `!llama_model_is_hybrid()` (fail-closed; null model also
+   skips): dense keeps the feature, hybrids behave exactly as pre-rebase.
+   Root-causing hybrid recurrent restore remains open work.
+5. Mid-prompt stores stay dormant for PART models by upstream design
+   (checkpoint gate needs FULL/RS/SWA) - same as pre-rebase. The deferred
+   in-memory ring still benefits warm slots on hybrids; only SSD
+   persistence is gated.
