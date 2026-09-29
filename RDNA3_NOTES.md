@@ -258,8 +258,25 @@ Findings, in order:
    dense attention, Q4_K, 26B) restores BIT-IDENTICALLY (194/194 chars,
    1585/1586 cached) - so it is not MoE, size, or quant related. Only
    SSM/recurrent state is implicated (speculative decoding was never
-   enabled in any run, ruling out the MTP draft). Root-causing hybrid
-   recurrent restore remains open work.
+   enabled in any run, ruling out the MTP draft). Leads for whoever picks
+   up the root cause (all measured 2026-09-29, none yet pursued to a fix):
+   - `test-recurrent-state-rollback` FAILS on LFM2.5-350M (CPU, core code,
+     no server): `test_multi_seq_split_replay` logits mismatch (max diff
+     1.28), then the binary aborts. That test exercises rollback+replay,
+     not plain save/load, so it may be a sibling bug rather than the same
+     one - but it proves recurrent-state handling is fragile on hybrids
+     in this tree.
+   - The fork modifies the recurrent core vs upstream (`llama-memory-
+     recurrent.cpp` +82: rollback fall-through instead of GGML_ABORT,
+     plus a new `seq_rm_positions_only` used by hybrid/iswa seq_rm paths).
+     Either could interact with the failing test above; `git diff
+     680a03628 HEAD -- src/llama-memory-recurrent.cpp` shows both.
+   - Ruled out: MTP draft/speculative path (never enabled), Vulkan-vs-CPU
+     backend (identical corruption on both), MoE/size/quant (gemma-4
+     dense-MoE restores bit-exact), push-constant/flag plumbing
+     (store+restore verified byte-consistent), uninitialized lists and
+     scatter order (bisected live on GPU). What remains is inside core
+     recurrent state_write/read fidelity for SSM tensors.
 5. Mid-prompt stores stay dormant for PART models by upstream design
    (checkpoint gate needs FULL/RS/SWA) - same as pre-rebase. The deferred
    in-memory ring still benefits warm slots on hybrids; only SSD
