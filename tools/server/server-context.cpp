@@ -2649,6 +2649,26 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+
+        // SSD-backed KV cache: store checkpoint on disk. Restored from the
+        // pre-rebase tree, where this call lived next to the log line above;
+        // the rebase dropped it when this block was refactored. Skip the
+        // store outright on a media turn: an empty token run would otherwise
+        // land a 0-token checkpoint in the index. conv_hash is 0 (no per-slot
+        // conversation hash in the current tree); the manager routes to the
+        // anonymous bucket and user_id still scopes per-user caches.
+        if (ssd_page_manager) {
+            static const llama_tokens none;
+            const auto & prefix_tokens = slot.prompt.tokens.has_mtmd ? none : slot.prompt.tokens.get_tokens();
+            if (!prefix_tokens.empty()) {
+                ssd_page_manager->store_checkpoint_with_tokens(
+                    slot.id, ctx_tgt, ctx_dft, cur,
+                    prefix_tokens.data(),
+                    prefix_tokens.size(),
+                    ssd_turn_counter, 0,
+                    slot.task ? slot.task->user_id : std::string());
+            }
+        }
     }
 
     // returns false to decline the task, it is offered again after the decode is done

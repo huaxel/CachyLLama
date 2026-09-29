@@ -225,3 +225,22 @@ Neutral-to-slightly-positive, within single-rep noise - consistent with the
 synthetic "noise @ low expert count" finding. No regression on a second
 architecture: default-on is safe everywhere measured (big win at 128
 experts, harmless elsewhere).
+
+### Server SSD-cache runtime validation (2026-09-29, Qwen3.6-35B-A3B, Vulkan)
+
+`llama-server` (Vulkan build) serves correctly with `--cache-ssd`:
+14k-token prefill + decode, health endpoint, graceful shutdown, zero
+errors. SSD manager + system cache initialize (dirs created).
+
+Two findings from the smoke test:
+1. The rebase had dropped both `store_checkpoint_with_tokens` call sites
+   (the whole `deferred_create_final_checkpoint` mechanism is also gone
+   upstream-side). The mid-prompt store was restored next to the surviving
+   `create_checkpoint` log line, adapted to current names
+   (`ssd_page_manager`, no `slot.conv_hash` -> anonymous bucket).
+2. Stores still don't fire for this model, **by upstream design**: the
+   checkpoint gate requires FULL/RS/SWA removal, and this model reports
+   PARTIAL (`seq_rm=1`, measured live). No checkpoints -> no SSD writes,
+   identical to pre-rebase behavior. The SSD path engages for
+   FULL/RS-removal or SWA models. Deferred-final restoration remains
+   follow-up work (larger port against the refactored completion path).
