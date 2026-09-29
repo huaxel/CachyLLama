@@ -194,3 +194,18 @@ The win shrinks as expert count drops (32-expert cases are within noise);
 the prepass replaces a per-workgroup full-ids rescan, so it pays off when
 n_as and the token count are large. Decode (n=1) is the big winner - this
 is the MoE decode path. Correctness: both configs pass 19003/19003.
+
+### Row-lists end-to-end on a real MoE (2026-09-29, Strix Halo)
+
+`llama-bench`, Qwen3.6-35B-A3B-UD-Q4_K_M (21.1 GiB), full offload, fa=1,
+Vulkan, `-r 1`:
+
+| test | row-lists off | on (default) | delta |
+|---|---|---|---|
+| pp512 | 1357.2 t/s | 1579.0 t/s | +16.3% |
+| tg128 | 59.0 t/s | 63.3 t/s | +7.3% |
+
+The synthetic -42% MMID time win is diluted end-to-end (attention and
+non-MoE ops dominate less-touched time), but the prepass is a clear
+real-model win in both prefill and decode, matching the 128-expert
+synthetic direction.
