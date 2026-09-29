@@ -210,3 +210,18 @@ The synthetic -42% MMID time win is diluted end-to-end (attention and
 non-MoE ops dominate less-touched time), but the prepass is a clear
 real-model win in both prefill and decode, matching the 128-expert
 synthetic direction.
+
+### Row-lists on a second MoE topology (gemma-4-26B-A4B, same day)
+
+`llama-bench`, gemma-4-26B-A4B QAT Q4_K_XL (13.3 GiB), full offload, fa=1,
+`-r 1`:
+
+| test | row-lists off | on (default) | delta |
+|---|---|---|---|
+| pp512 | 1785.2 t/s | 1822.3 t/s | +2.1% |
+| tg128 | 70.9 t/s | 72.1 t/s | +1.6% |
+
+Neutral-to-slightly-positive, within single-rep noise - consistent with the
+synthetic "noise @ low expert count" finding. No regression on a second
+architecture: default-on is safe everywhere measured (big win at 128
+experts, harmless elsewhere).
