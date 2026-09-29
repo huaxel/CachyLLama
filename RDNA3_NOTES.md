@@ -262,15 +262,13 @@ Findings, in order:
    up the root cause (all measured 2026-09-29, none yet pursued to a fix):
    - `test-recurrent-state-rollback` FAILS on LFM2.5-350M (CPU, core code,
      no server): `test_multi_seq_split_replay` logits mismatch (max diff
-     1.28), then the binary aborts. That test exercises rollback+replay,
-     not plain save/load, so it may be a sibling bug rather than the same
-     one - but it proves recurrent-state handling is fragile on hybrids
-     in this tree.
-   - The fork modifies the recurrent core vs upstream (`llama-memory-
-     recurrent.cpp` +82: rollback fall-through instead of GGML_ABORT,
-     plus a new `seq_rm_positions_only` used by hybrid/iswa seq_rm paths).
-     Either could interact with the failing test above; `git diff
-     680a03628 HEAD -- src/llama-memory-recurrent.cpp` shows both.
+     1.28), then the binary aborts. ATTRIBUTED 2026-09-29: pristine
+     upstream `680a03628` fails BIT-IDENTICALLY (same diff, same position),
+     so this is an upstream bug on a new arch, not fork-caused; the fork's
+     recurrent diffs are exonerated for it. It exercises rollback+replay,
+     not plain save/load, so it may be a sibling rather than the SSD cause
+     - but it proves recurrent-state handling is fragile on hybrids
+     upstream, independently of this fork.
    - Ruled out: MTP draft/speculative path (never enabled), Vulkan-vs-CPU
      backend (identical corruption on both), MoE/size/quant (gemma-4
      dense-MoE restores bit-exact), push-constant/flag plumbing
