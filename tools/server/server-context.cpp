@@ -2707,38 +2707,95 @@ private:
         }
         auto & cur = *cur_ptr;
 
-        // Save prompt boundaries: pos_min=0 (start of prompt), pos_max=prompt_n_tokens-1 (end of prompt)
-        cur.update_pos(prompt_n_tokens, 0, (llama_pos)prompt_n_tokens - 1);
+        // Strict-prefix save: the stored state must leave at least one task
+        // token unevaluated, so restore continues with a fresh (not forced)
+        // decode of the boundary token. Saving the full live state would
+        // leave zero unevaluated tokens, forcing a destructive re-decode of
+        // cached recurrent state on restore (attention KV overwrite is
+        // idempotent, the recurrent transition is not - it would advance
+        // twice and corrupt generation).
+        //
+        // The strip point differs by memory type. Recurrent state cannot
+        // un-apply its last token, so drop it (p0 = N-1, snapshot path) and
+        // re-decode it fresh on restore. Dense keeps the exact boundary
+        // (p0 = N, plain strip) with unchanged behavior.
+        const bool has_rs = llama_n_rs_seq(ctx_tgt) >= 1;
+        const llama_pos strip_p0 = has_rs ? (llama_pos)prompt_n_tokens - 1 : (llama_pos)prompt_n_tokens;
 
-        // The checkpoint metadata says n_tokens=prompt_n_tokens (prompt only),
-       // but update_tgt/update_dft save the FULL KV cache including generated
-       // token entries.  A metadata/data mismatch causes hallucination on
-       // restore: the model loads generated-token KV cache and attends to its
-       // own previous output.  Fix: temporarily strip generated-token entries
-       // from the live KV cache, save the prompt-only state, then restore the
-       // full KV cache so continued generation is unaffected.
+        // Save prompt boundaries: the live cache is stripped to [0, strip_p0)
+        // below; n_tokens and pos_max describe the stripped state.
+        cur.update_pos(strip_p0, 0, strip_p0 - 1);
+
+        // The checkpoint metadata says n_tokens=strip_p0 (strict prompt
+        // prefix for recurrent, full prompt for dense), but update_tgt saves
+        // the FULL live state including any generated token entries.  A
+        // metadata/data mismatch causes hallucination on restore.  Fix:
+        // temporarily strip entries at positions >= strip_p0 from the live
+        // cache, save the prefix state, then restore the full cache so
+        // continued generation is unaffected.
+        //
+        // The strip uses plain seq_rm (not seq_rm_attn_only): for recurrent
+        // state this takes the rollback-snapshot path (never positions_only,
+        // which would evict the sequence from its own cell and save EMPTY
+        // recurrent state). With a clean prompt-only cache the strip is a
+        // no-op; with decoded generation tokens it snapshots exactly one.
         {
             // --- ctx_tgt (main model KV cache) ---
+            // Full (not partial) round-trip: plain seq_rm also strips
+            // attention KV, which must be restored for live generation.
             size_t full_size = llama_state_seq_get_size_ext(
-                ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                ctx_tgt, slot.id, 0);
             std::vector<uint8_t> full_state;
             if (full_size > 0) {
                 full_state.resize(full_size);
                 llama_state_seq_get_data_ext(ctx_tgt, full_state.data(),
-                    full_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    full_size, slot.id, 0);
             }
 
+            bool strip_ok = false;
             auto * mem_tgt = llama_get_memory(ctx_tgt);
             if (mem_tgt) {
-                llama_memory_seq_rm_attn_only(
-                    mem_tgt, slot.id, (llama_pos)prompt_n_tokens, -1);
+                strip_ok = llama_memory_seq_rm(
+                    mem_tgt, slot.id, strip_p0, -1);
+            }
+            // Post-condition: live coverage must end exactly at strip_p0 - 1.
+            // Anything else (failed snapshot, wiped state) aborts the store;
+            // the live cache is restored below regardless.
+            if (strip_ok && mem_tgt) {
+                strip_ok = llama_memory_seq_pos_max(mem_tgt, slot.id) == strip_p0 - 1;
             }
 
-            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (strip_ok) {
+                cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                // SSD store serializes the stripped live state (not the
+                // restored full state below), so it must run before undo.
+                if (ssd_page_manager) {
+                    static const llama_tokens no_tokens;
+                    const server_tokens & src = slot.task ? slot.task->tokens : slot.prompt.tokens;
+                    const llama_tokens & prefix_tokens = src.has_mtmd ? no_tokens : src.get_tokens();
+                    if (!prefix_tokens.empty()) {
+                        uint64_t conv_hash = kv_ssd_hash_tokens((const uint32_t *)prefix_tokens.data(),
+                            std::min(prefix_tokens.size(), (size_t)1024));
+                        if (conv_hash == 0) conv_hash = 1;
+                        ssd_page_manager->store_checkpoint_with_tokens(
+                            slot.id, ctx_tgt, ctx_dft, cur, prefix_tokens.data(),
+                            prefix_tokens.size(), ssd_turn_counter, conv_hash,
+                            slot.task ? slot.task->user_id : std::string());
+                    }
+                }
+            }
 
             if (!full_state.empty()) {
                 llama_state_seq_set_data_ext(ctx_tgt, full_state.data(),
-                    full_state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    full_state.size(), slot.id, 0);
+            }
+
+            if (!strip_ok) {
+                // Never leave a dataless entry behind: it would claim
+                // coverage it cannot restore.
+                slot.prompt.checkpoints.pop_back();
+                return;
             }
         }
 
@@ -2775,27 +2832,6 @@ private:
                 recycled ? "recycled" : "pushed",
                 slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
                 cur.pos_min, (float)cur.size() / 1024 / 1024);
-
-        // SSD-backed KV cache: store final checkpoint on disk. Ported from
-        // the pre-rebase tree; conv_hash is a content hash (no per-slot
-        // conversation hash in the current tree). 0 is the null bucket.
-        // Skipped for hybrid models: their restored recurrent state generates
-        // off-topic text (measured 2026-09-29), so storing 340 MiB per prompt
-        // buys nothing until hybrid restore is root-caused.
-        if (ssd_page_manager && !(model_tgt && llama_model_is_hybrid(model_tgt))) {
-            static const llama_tokens no_tokens;
-            const server_tokens & src = slot.task ? slot.task->tokens : slot.prompt.tokens;
-            const llama_tokens & prefix_tokens = src.has_mtmd ? no_tokens : src.get_tokens();
-            if (!prefix_tokens.empty()) {
-                uint64_t conv_hash = kv_ssd_hash_tokens((const uint32_t *)prefix_tokens.data(),
-                    std::min(prefix_tokens.size(), (size_t)1024));
-                if (conv_hash == 0) conv_hash = 1;
-                ssd_page_manager->store_checkpoint_with_tokens(
-                    slot.id, ctx_tgt, ctx_dft, cur, prefix_tokens.data(),
-                    prefix_tokens.size(), ssd_turn_counter, conv_hash,
-                    slot.task ? slot.task->user_id : std::string());
-            }
-        }
     }
 
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
@@ -2868,9 +2904,8 @@ private:
         // store outright on a media turn: an empty token run would otherwise
         // land a 0-token checkpoint in the index. conv_hash is a content hash
         // (no per-slot conversation hash in the current tree); 0 is the null
-        // bucket and is rejected, so it is never passed. Skipped for hybrid
-        // models (see above): unrestorable checkpoints are pure disk bloat.
-        if (ssd_page_manager && !(model_tgt && llama_model_is_hybrid(model_tgt))) {
+        // bucket and is rejected, so it is never passed.
+        if (ssd_page_manager) {
             static const llama_tokens none;
             const auto & prefix_tokens = slot.prompt.tokens.has_mtmd ? none : slot.prompt.tokens.get_tokens();
             if (!prefix_tokens.empty()) {
@@ -3715,17 +3750,17 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        // Set when the SSD block below restores full state for this
+                        // task: the RAM-checkpoint block further down must not
+                        // re-derive n_past from the checkpoint it just created
+                        // (exclusive end counting yields n_tokens-1, forcing a
+                        // destructive re-decode of the last cached token).
+                        bool ssd_restored_this_task = false;
                         SLT_DBG(slot, "[PROBE] prefill-init n_past=0 slot.prompt=%zu ssd_page_manager=%d cache_prompt=%d\n",
                                 slot.prompt.tokens.size(), (int)(ssd_page_manager != nullptr), (int)slot.task->params.cache_prompt);
 
                         // Must populate slot.prompt.tokens so get_common_prefix() finds the match.
-                        // Skipped for hybrid (SSM/recurrent) models: restored recurrent
-                        // state produces off-topic generations (measured 2026-09-29:
-                        // Qwen3.6-35B-A3B full-prefill on-topic vs SSD-restored
-                        // off-topic corpus text at temp 0; dense MiniCPM5-2B
-                        // restores bit-identically). model_tgt null also skips.
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager &&
-                                !(model_tgt && llama_model_is_hybrid(model_tgt))) {
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager) {
                             static const llama_tokens no_task_tokens;
                             const auto & task_tokens = slot.task->tokens.has_mtmd
                                 ? no_task_tokens : slot.task->tokens.get_tokens();
@@ -3874,7 +3909,7 @@ private:
                                     // load_tgt/load_dft are no-ops — the
                                     // SSD restore already loaded full state.
                                     auto & ckpt = slot.prompt.checkpoints.emplace_back();
-                                    ckpt.update_pos(n_push, 0, (llama_pos)n_push);
+                                    ckpt.update_pos(n_push, 0, n_push > 0 ? (llama_pos)n_push - 1 : 0);
 
                                     // Restore speculative impl state (pending_h for MTP)
                                     // so the first draft after cold-start is consistent.
@@ -3884,6 +3919,7 @@ private:
 
                                     // Flag that SSD cache restored this slot.
                                     slot.ssd_cold_start_used = true;
+                                    ssd_restored_this_task = true;
                                     // For hybrid models with partial coverage, n_past was already set to ssd_lcp above.
                                     // For dense models with partial LCP match, n_past was also set above.
                                     // For full coverage (hybrid or dense, non-partial), set n_past to n_push.
@@ -4042,7 +4078,14 @@ private:
                                     n_past, (int)pos_next, n_swa, (int)has_new_tokens, pos_min_thold,
                                     slot.prompt.checkpoints.size(), (int)slot.ssd_cold_start_used);
 
-                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            // Skip when the SSD block above already restored full state
+                            // for this task: re-deriving n_past from the checkpoint
+                            // created for that restore would drop the last cached
+                            // token (exclusive end counting), forcing a destructive
+                            // re-decode of recurrent state. n_past already holds
+                            // the SSD-provided value, which leaves the boundary
+                            // token unevaluated for a fresh (correct) decode.
+                            if (!ssd_restored_this_task && n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 SLT_DBG(slot, "[PROBE] in-block n_past=%d pos_min=%d pos_min_thold=%d\n",
                                         n_past, pos_min, pos_min_thold);
@@ -4119,6 +4162,20 @@ private:
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    // Recurrent/hybrid slots never reuse RAM checkpoints:
+                                    // the exclusive recount (n_past from size_up_to_pos)
+                                    // drops the last cached token, whose re-decode
+                                    // would advance recurrent state twice (attention
+                                    // KV overwrite is idempotent, the recurrent
+                                    // transition is not). Force a full reset and clear
+                                    // the sequence so prefill starts from clean state.
+                                    // (SSD cold restores are unaffected: they set n_past
+                                    // directly and skip this block.)
+                                    const bool hybrid_slot = model_tgt &&
+                                        (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt));
+                                    if (hybrid_slot) {
+                                        do_reset = true;
+                                    }
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
@@ -4140,6 +4197,13 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                        if (hybrid_slot) {
+                                            // Drop leftover recurrent/attention state: the
+                                            // fresh prefill below must start clean (the
+                                            // retained cells would otherwise feed stale
+                                            // recurrent state into position 0).
+                                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                        }
                                     }
                                 }
                             }

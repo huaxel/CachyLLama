@@ -281,6 +281,10 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // tokens per sequence in the ubatch that built this graph; baked into the
+    // snapshot maintenance copies below, so it must match for valid reuse
+    int64_t n_seq_tokens = 0;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

@@ -279,3 +279,46 @@ Findings, in order:
    (checkpoint gate needs FULL/RS/SWA) - same as pre-rebase. The deferred
    in-memory ring still benefits warm slots on hybrids; only SSD
    persistence is gated.
+
+### Hybrid recurrent restore: root-caused and fixed in-fork (2026-09-29)
+
+The fail-closed gate above is REMOVED. Three stacked defects, all fixed and
+validated bit-exact (Qwen3.5-2B CPU: cold-restore A/B identical over 25
+tokens, first-token logprobs identical to 16 digits; slot-reuse identical;
+test-recurrent-state-rollback passes on LFM2.5-350M and Qwen3.5-0.8B):
+
+1. Stale rollback snapshots across decodes (core, all recurrent archs).
+   Each decode rewrote only the trailing min(n_tokens, K) snapshot slots,
+   leaving deeper slots stale; any rollback spanning a decode boundary read
+   garbage. Upstream's own test TODO admits rollback "is only correct
+   after a ubatch with more than n_rs_seq tokens". Fix: build_rs now emits
+   a snapshot shift-register (descending slot copies before the arch fresh
+   writes), so slot s always holds the state s tokens back. n_seq_tokens
+   baked into the graph is part of the reuse key. One choke point covers
+   lfm2/mamba/delta-net/bailingmoe3/kimi/minimax/plamo2/qwen.
+2. No snapshot capacity on the server (common). cparams.n_rs_seq came only
+   from speculation config, so served hybrids had K=1 (no snapshots at
+   all). common_init now forces n_rs_seq=1 for recurrent/hybrid models
+   (minimal; buffers grow x2, not x9).
+3. Deferred-final saved full live state labeled as prompt-only (server).
+   Restore then had zero unevaluated tokens, forcing a re-decode of cached
+   recurrent state (attention overwrite is idempotent, the recurrent
+   transition is not - double-advance = degenerate loop / off-topic
+   corpus). Fix: strip to a STRICT prefix (plain seq_rm snapshot path at
+   N-1 for recurrent, exact N for dense) with post-condition check, store
+   SSD bytes BEFORE undoing the strip into live state, and skip the RAM
+   recount that would re-derive n_past=80 from the new 80-token checkpoint.
+   Warm hybrid slots force do_reset + full memory clear (full prefill per
+   turn; correct over fast - SSD still accelerates cold starts). The old
+   v4 checkpoint files (full-coverage claims) are clean-missed via
+   KV_SSD_VERSION 5.
+
+Deliberately NOT fixed (pre-existing, upstream-shared, out of scope):
+- Dense 1-token-continuation skew (~0.04 logprob, flips knife-edge argmax
+  downstream; first-token argmax unaffected). Affects RAM and SSD paths
+  identically; fresh-vs-fresh is bit-exact, so it is batch-shape numerics
+  in single-token continuation prefills, not state corruption.
+- Full-batch vs cold-streaming logit variance (~1.1) in the unit-test probe
+  on MiniCPM5 AND LFM2.5, identical with and without the shift fix:
+  pre-existing upstream behavior, no real workload does cold streaming.
+- Partial-LCP hybrid restores keep the conservative 80%-or-reject gate.

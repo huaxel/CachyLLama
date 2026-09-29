@@ -356,6 +356,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= n_seq_tokens == params.ubatch.n_seq_tokens;
 
     return res;
 }
@@ -1132,6 +1133,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->n_seq_tokens == params.ubatch.n_seq_tokens;
 
     return res;
 }
@@ -1175,6 +1177,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->n_seq_tokens == params.ubatch.n_seq_tokens;
 
     return res;
 }
@@ -1263,6 +1266,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->n_seq_tokens == params.ubatch.n_seq_tokens;
 
     return res;
 }
@@ -3539,6 +3543,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->n_seq_tokens = ubatch.n_seq_tokens;
 
     return inp;
 }
@@ -3559,9 +3564,31 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+    ggml_tensor * res = build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+
+    // Shift the older snapshot slots up so rollback stays valid when this decode
+    // holds fewer than K new tokens per sequence: slot s must keep the state s
+    // tokens back, but the arch write code below only refreshes slots [0, n).
+    // Move old slot [0, K-n) to [n, K) first (descending, src and dst overlap),
+    // then the fresh writes land on [0, n). No-op when n covers all slots.
+    {
+        const int64_t mem_size = kv_state->get_size();
+        const int64_t n_slots  = mem_size > 0 ? s->ne[1]/mem_size : 1;
+        const int64_t n_shift  = inp->n_seq_tokens;
+        const int64_t rs_head  = kv_state->get_head();
+        const size_t  row_size = ggml_row_size(s->type, s->ne[0]);
+        for (int64_t slot = n_slots - 1; slot >= n_shift && n_shift > 0; --slot) {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+                ggml_view_2d(ctx0, s, s->ne[0], n_seqs, s->nb[1],
+                    (size_t) ((slot - n_shift)*mem_size + rs_head)*row_size),
+                ggml_view_2d(ctx0, s, s->ne[0], n_seqs, s->nb[1],
+                    (size_t) (slot*mem_size + rs_head)*row_size)));
+        }
+    }
+
+    return res;
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

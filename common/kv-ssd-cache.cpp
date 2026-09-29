@@ -41,7 +41,12 @@ static const uint32_t KV_SSD_MAGIC_REC   = 0x4B565243; // "KVRC"
 //      contents payload (currently 1, bumped only when the payload
 //      layout itself changes - rare). The header version is
 //      KV_SSD_VERSION.
-static const uint32_t KV_SSD_VERSION              = 4;
+// v5: deferred-final checkpoints now cover a strict prompt prefix
+//      ([0, N-1) instead of [0, N]) so restore continues with a fresh
+//      boundary-token decode. v4 files claim full coverage while the
+//      recurrent state needs the boundary re-decode; loading them would
+//      silently corrupt hybrid generation, so they are clean-missed here.
+static const uint32_t KV_SSD_VERSION              = 5;
 static const uint32_t KV_SSD_CACHE_FORMAT_VERSION = 1;
 
 // =============================================================================

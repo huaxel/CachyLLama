@@ -1300,7 +1300,23 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    llama_context * lctx = nullptr;
+    {
+        // Recurrent/hybrid models need rollback snapshot capacity so partial
+        // sequence removal takes the snapshot path: the server strips the
+        // last prompt token before saving a checkpoint (strict prefix) and
+        // speculation recovery rolls back drafts. Without it, sequence removal
+        // falls through to full cell clearing. Attention KV overwrite is
+        // idempotent but the recurrent transition is not, so exact removal
+        // matters. Keep it minimal (1) on top of what speculation needs;
+        // the state buffers grow with it.
+        if (cparams.n_rs_seq < 1 &&
+                (llama_model_is_hybrid(model) || llama_model_is_recurrent(model))) {
+            COM_INF("enabling 1 rollback snapshot slot for recurrent model (was %u)\n", cparams.n_rs_seq);
+            cparams.n_rs_seq = 1;
+        }
+        lctx = llama_init_from_model(model, cparams);
+    }
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
