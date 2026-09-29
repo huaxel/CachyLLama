@@ -321,9 +321,15 @@ prefill matching.
 
 Deliberately NOT fixed (pre-existing, upstream-shared, out of scope):
 - Dense 1-token-continuation skew (~0.04 logprob, flips knife-edge argmax
-  downstream; first-token argmax unaffected). Affects RAM and SSD paths
-  identically; fresh-vs-fresh is bit-exact, so it is batch-shape numerics
-  in single-token continuation prefills, not state corruption.
+  downstream; first-token argmax unaffected; fresh-vs-fresh is bit-exact).
+  Root-caused 2026-09-29 to recompute numerics, NOT state: an in-process
+  probe (trim + re-decode, NO save/load at all) skews by the identical
+  0.60 at the identical token as the save/load path, while save/load/save
+  round-trips 0 diffs. Recomputing a token in a 1-token batch diverges from
+  the original full-batch computation on batch-sensitive models (MiniCPM5),
+  while Qwen restores bit-exact to 16 digits - so it is model-dependent
+  kernel numerics in upstream code, identical on the RAM-checkpoint path.
+  Dense keeps the exact-boundary strip (unchanged upstream behavior).
 - Full-batch vs cold-streaming logit variance (~1.1) in the unit-test probe
   on MiniCPM5 AND LFM2.5, identical with and without the shift fix:
   pre-existing upstream behavior, no real workload does cold streaming.

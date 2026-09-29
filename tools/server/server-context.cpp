@@ -2710,15 +2710,22 @@ private:
         // Strict-prefix save: the stored state must leave at least one task
         // token unevaluated, so restore continues with a fresh (not forced)
         // decode of the boundary token. Saving the full live state would
-        // leave zero unevaluated tokens, forcing a destructive re-decode of
-        // cached recurrent state on restore (attention KV overwrite is
-        // idempotent, the recurrent transition is not - it would advance
-        // twice and corrupt generation).
+        // leave zero unevaluated tokens, forcing a re-decode of the last
+        // cached token on restore. That re-decode is destructive for
+        // recurrent state (attention KV overwrite is idempotent, but the
+        // recurrent transition advances twice and corrupts generation) and
+        // measurably lossy for dense state (recompute in a 1-token batch
+        // diverges from the original full-batch computation). The strip
+        // below drops exactly the boundary token for recurrent memory, so
+        // restore always continues with one fresh decode; dense keeps the
+        // exact boundary with unchanged upstream behavior.
         //
-        // The strip point differs by memory type. Recurrent state cannot
-        // un-apply its last token, so drop it (p0 = N-1, snapshot path) and
-        // re-decode it fresh on restore. Dense keeps the exact boundary
-        // (p0 = N, plain strip) with unchanged behavior.
+        // The strip uses plain seq_rm (not seq_rm_attn_only): for recurrent
+        // state this takes the rollback-snapshot path (never positions_only,
+        // which would evict the sequence from its own cell and save EMPTY
+        // recurrent state). With a clean prompt-only cache the strip removes
+        // just the last prompt token; with decoded generation tokens it
+        // additionally snapshots exactly one.
         const bool has_rs = llama_n_rs_seq(ctx_tgt) >= 1;
         const llama_pos strip_p0 = has_rs ? (llama_pos)prompt_n_tokens - 1 : (llama_pos)prompt_n_tokens;
 
