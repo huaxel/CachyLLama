@@ -5,13 +5,14 @@ Last updated: 2026-07-20
 ## Goal
 
 Document Vulkan-backend tuning findings for AMD RDNA3 APUs (Phoenix1/Phoenix,
-gfx1103, e.g. 7840U/7840HS with Radeon 780M). Companion to STRIX_HALO_NOTES.md
-which targets gfx1151 (RDNA3.5) ROCm.
+gfx1103, e.g. 7840U/7840HS with Radeon 780M; extended 2026-09-29 with Strix
+Halo gfx1151 Vulkan validation). Historical ROCm-side companion notes
+(STRIX_HALO_NOTES.md, CEZANNE_NOTES.md) live in git history only - the
+2026-09-05 docs audit deliberately removed them from the tree.
 
-Unlike STRIX_HALO_NOTES, this is for the **Vulkan** backend on RDNA3, not
-ROCm/HIP. ROCm-on-RDNA3 has stability issues on Mesa (GLM-4.7-Flash and
-DeepSeek2 MLA produce zero generation tokens), so Vulkan is the default
-backend for the 7840U.
+This file is for the **Vulkan** backend, not ROCm/HIP. ROCm-on-RDNA3 has
+stability issues on Mesa (GLM-4.7-Flash and DeepSeek2 MLA produce zero
+generation tokens), so Vulkan is the default backend for the 7840U.
 
 ## Environment
 
