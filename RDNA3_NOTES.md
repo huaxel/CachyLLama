@@ -145,7 +145,18 @@ matching order plus the branch), so the cm1 path uses lists too and the
 fallback is currently untriggered. Kept as a safety hatch for future
 shaders without list support (e.g. a coopmat2-MMID variant).
 
-### GGML_VK_FA_KV_CONTIG (default: on, set =0 to disable) - FIXED 2026-09-29
+### GGML_VK_FA_KV_CONTIG (default: off, set =1 to enable) - FIXED + RE-MEASURED
+
+Correctness fixed 2026-09-29 (source-indexing bug on strided views; see
+below). But perf re-measurement after the fix shows the feature is now a
+NET REGRESSION on engaged shapes (Strix Halo, `test-backend-ops perf`,
+kv_view=1, 138 cases): every nb=4096 prefill shape regressed with the
+transpose on - hsk=576: +33%/+41% (0.75-1.20ms -> 1.00-1.20ms), hsk=128:
++12..+14%, hsk=64: +14% - and no engaged shape improved. nb=1 (non-engaged)
+deltas were +/-10-15% run noise. The upstream FA dispatch refactor removed
+the strided-read penalty (~2-5x) the transpose was built to dodge; the
+extra full-KV copy pass now costs more than it saves. Default flipped to
+opt-in; correctness passes either way (5297/5297 both configs).
 
 The strided-f16-KV contiguize transpose (`dequant_f16_transpose` prepass in
 `ggml_vk_flash_attn`) read its source linearly while engaging on strided
