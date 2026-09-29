@@ -228,6 +228,10 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // set when this slot's KV state came from an SSD cold-start restore;
+    // downstream paths must not assume a fully validated in-memory state
+    bool ssd_cold_start_used = false;
+
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
@@ -865,8 +869,6 @@ private:
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
-
-    llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
 
@@ -1654,6 +1656,7 @@ private:
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        bool session_reset = false;
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1702,6 +1705,7 @@ private:
 
             if (ret != nullptr) {
                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                const float sim_best = f_sim_best;
 
                 if (task.id_slot == -1) {
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
@@ -1767,6 +1771,13 @@ private:
                     }
                 }
             }
+        }
+
+        // Slot-shrink guard fired above: drop the slot's KV cache and prompt
+        // tokens now so the next launch does a fresh prefill instead of
+        // reusing stale recurrent state from the trimmed conversation.
+        if (session_reset && ret) {
+            ret->prompt_clear();
         }
 
         // find the slot that has been least recently used

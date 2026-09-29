@@ -226,6 +226,15 @@ struct vk_op_count_experts_push_constants {
     uint32_t ne00L;
 };
 
+struct vk_op_mmid_row_lists_push_constants {
+    uint32_t nei0;
+    uint32_t nei1;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t a_offset;
+    uint32_t n_as;
+};
+
 struct vk_op_glu_push_constants {
     uint32_t N;
     uint32_t ne00;
@@ -694,6 +703,33 @@ struct vk_op_lightning_indexer_push_constants {
 };
 
 static_assert(sizeof(vk_op_lightning_indexer_push_constants) <= 128);
+
+// Coopmat prefill/decode variants use a distinct layout: HEAD_SIZE=128,
+// N_HEAD=64, K=F16 hardcoded; all strides element-based.
+struct vk_op_lightning_indexer_cm_push_constants {
+    uint32_t n_kv;
+    uint32_t n_batch;
+    uint32_t n_stream;
+    uint32_t nem3;
+    uint32_t nb1;
+    uint32_t nb3;
+    uint32_t nbq1;
+    uint32_t nbq2;
+    uint32_t nbq3;
+    uint32_t nbk2;
+    uint32_t nbk3;
+    uint32_t nbw1;
+    uint32_t nbw3;
+    uint32_t nbm1;
+    uint32_t nbm3;
+    uint32_t q_offset;
+    uint32_t k_offset;
+    uint32_t w_offset;
+    uint32_t m_offset;
+    uint32_t d_offset;
+};
+static_assert(sizeof(vk_op_lightning_indexer_cm_push_constants) <= 128,
+              "sizeof(vk_op_lightning_indexer_cm_push_constants) must be <= 128");
 
 struct vk_op_gated_delta_net_push_constants {
     uint32_t H;

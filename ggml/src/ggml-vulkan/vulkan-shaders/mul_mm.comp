@@ -296,7 +296,6 @@ void main() {
     } else if (p.hoist_row_ids != 0) {
         load_row_ids_hoisted(expert_idx, ic);
     } else {
-    } else {
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
         if (bitCount(p.nei0) == 1) {
             load_row_ids(expert_idx, true, ic);
