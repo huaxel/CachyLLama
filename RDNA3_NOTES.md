@@ -287,6 +287,12 @@ validated bit-exact (Qwen3.5-2B CPU: cold-restore A/B identical over 25
 tokens, first-token logprobs identical to 16 digits; slot-reuse identical;
 test-recurrent-state-rollback passes on LFM2.5-350M and Qwen3.5-0.8B):
 
+Follow-up validation (same evening): Qwen3.6-35B-A3B (the original
+corrupter) cold-restore A/B BIT-EXACT over 25 tokens; build-vk server
+binary A/B bit-exact on Qwen3.5-2B; v4-format files clean-rejected
+("removed 8 checkpoints from an older format version") with fresh
+prefill matching.
+
 1. Stale rollback snapshots across decodes (core, all recurrent archs).
    Each decode rewrote only the trailing min(n_tokens, K) snapshot slots,
    leaving deeper slots stale; any rollback spanning a decode boundary read
