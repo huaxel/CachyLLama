@@ -8361,11 +8361,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // cm1 direct-from-global coopMatLoads run ~2-5x slower on those strided rows than
     // on per-head-contiguous K/V. dequant_f16_transpose.comp is a pure strided copy.
     // Engages only when the rows are actually strided, prefill only (N >= 64).
-    // GGML_VK_FA_KV_CONTIG=0 opts out. The contiguize transpose had a
-    // source-indexing bug on strided views (strides applied to the wrong
-    // dims); fixed and revalidated 2026-09-29 (see RDNA3_NOTES.md).
+    // GGML_VK_FA_KV_CONTIG=1 opts in. The contiguize transpose had a
+    // source-indexing bug (fixed 2026-09-29, see RDNA3_NOTES.md), but perf
+    // measurement shows it is now a net regression on engaged prefill
+    // shapes (+12..+41% on Strix Halo): the upstream FA dispatch refactor
+    // removed the strided-read penalty it was built to dodge. Default off.
     static const char * fa_kv_contig_env = getenv("GGML_VK_FA_KV_CONTIG");
-    const bool fa_kv_contig = !(fa_kv_contig_env && fa_kv_contig_env[0] == '0');
+    const bool fa_kv_contig = fa_kv_contig_env && fa_kv_contig_env[0] == '1';
     const bool kv_f16_strided = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
                                 neq1 >= 64 &&
                                 (k->nb[1] != (uint64_t)HSK * sizeof(ggml_fp16_t) ||
