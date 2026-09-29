@@ -198,7 +198,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
-        }
     }
 
     for (int il = 0; il < n_layer; ++il) {

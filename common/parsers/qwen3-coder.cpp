@@ -114,7 +114,6 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                         // Qwen emits scalar string arguments as raw text, including values
                         // constrained by enum/const fields; only non-string values use JSON.
                         arg_value = arg_string;
-                    }
                     } else {
                         // The string alternative accepts any text, so the grammar only keeps the raw string
                         // rule. The parser still tries the JSON alternatives first to type the value.

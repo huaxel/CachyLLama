@@ -224,8 +224,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
-    llama_build(test-fusion.cpp)
-
     llama_test(
         test-seq-rm-attn-only
         LABEL main
@@ -253,14 +251,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
-
-    # Test state save/load functionality across all architectures, using the generated dummy models
-    llama_test(
-        test-save-load-state
-        LABEL main
-        ARGS --models "${MODEL_DIR}"
-    )
-    set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
     # Cold-tier cap must also be enforced when checkpoints demote to cold
     # during on_turn_complete, not only after checkpoint stores

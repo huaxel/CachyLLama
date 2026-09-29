@@ -40,6 +40,8 @@ ttl_cache g_ram_cache;
 
 static const std::chrono::seconds CACHE_TTL(5);
 }  // namespace
+
+static bool host_available_ram_impl(std::size_t * out_bytes) {
 #ifdef __linux__
     struct sysinfo info;
     if (sysinfo(&info) == 0) {

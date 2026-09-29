@@ -242,6 +242,40 @@ bool kv_ssd_system_cache::load(const uint32_t* tokens, uint32_t n_tokens,
     return true;
 }
 
+bool kv_ssd_system_cache::load_prefix(const uint32_t* tokens, uint32_t n_tokens,
+                                       uint32_t min_match, std::vector<uint8_t>& out_data) {
+    if (!initialized || !tokens || n_tokens < min_match || min_match == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    for (auto & kv : entries_) {
+        auto & e = kv.second;
+        if (e.tokens.size() < min_match) {
+            continue;
+        }
+        bool ok = true;
+        for (uint32_t i = 0; i < min_match; i++) {
+            if (e.tokens[i] != tokens[i]) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        out_data = e.data;
+        e.last_used = now_unix();
+        e.access_count++;
+        stats_hits++;
+        return true;
+    }
+
+    stats_misses++;
+    return false;
+}
+
 // =============================================================================
 // Eviction
 // =============================================================================

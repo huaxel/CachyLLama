@@ -262,6 +262,9 @@ struct vk_pipeline_struct {
     std::atomic<bool> compiled {};
     // number of registers used, extracted from pipeline executable properties
     uint32_t register_count {};
+    // false for MMID shaders without a from_lists reader (int8 coopmat path):
+    // the row-list prepass would clobber the hoisted-layout region they read
+    bool supports_row_lists = true;
 
 #if defined(VK_EXT_shader_64bit_indexing)
     bool is_64b_indexing {};
@@ -732,6 +735,7 @@ struct vk_device_struct {
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
     uint32_t max_nodes_per_submit;
+    uint64_t max_bytes_per_submit;
 
     bool shader_64b_indexing;
 
@@ -844,6 +848,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_add_id_f32;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
+    vk_pipeline pipeline_concat_transpose_i32;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
     vk_pipeline pipeline_log[2];
@@ -982,6 +987,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     vk_pipeline pipeline_gated_linear_attn_f32;
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_lightning_indexer_cm_f16;
+    vk_pipeline pipeline_lightning_indexer_decode_cm_f16;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
@@ -1011,6 +1018,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<vk_pipeline, vk_pipeline>> pipeline_xe_fa_decode_dual_phases;
     vk_pipeline pipeline_count_experts;
+    vk_pipeline pipeline_mmid_row_lists;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];

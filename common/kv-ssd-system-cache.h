@@ -102,6 +102,12 @@ public:
     bool load(const uint32_t* tokens, uint32_t n_tokens,
               std::vector<uint8_t>& out_data);
 
+    // Load by prefix match: returns the first entry whose stored tokens
+    // agree with the input on the first min_match positions. Used for
+    // do_reset recovery where the exact system boundary is unknown.
+    bool load_prefix(const uint32_t* tokens, uint32_t n_tokens,
+                     uint32_t min_match, std::vector<uint8_t>& out_data);
+
     // Force-evict entries that have not been used in N days.
     // Returns the number of entries evicted.
     size_t expire_old_entries(int unused_days = -1);
