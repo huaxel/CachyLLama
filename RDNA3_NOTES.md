@@ -163,3 +163,23 @@ MMID pipelines now declare 6 descriptor bindings (A, B, D, IDS, counts,
 fused-scale); the upstream subgroup refactor hardcoded 5. If a new MMID
 pipeline creation call is added, it must use 6 (see `mul_mat_id_param_count`
 and the `create_mm_pipelines` ID call sites).
+
+### Row-list prepass performance (2026-09-29, Strix Halo q4_K MMID, cm1)
+
+`GGML_VK_MMID_ROWLISTS` on vs off, `test-backend-ops perf`, q4_K/f32,
+k=2048, 128 experts used 8 (decode-ish) and 32 experts used 4 (prefill-ish):
+
+| shape | off | on | delta |
+|---|---|---|---|
+| n_mats=128 n=1   | 21.4us | 12.4us | **-42%** |
+| n_mats=128 n=4   | 44.5us | 37.7us | **-15%** |
+| n_mats=128 n=32  | 1184us | 921us  | **-22%** |
+| n_mats=128 n=64  | 1511us | 965us  | **-36%** |
+| n_mats=128 n=128 | 1494us | 923us  | **-38%** |
+| n_mats=128 n=512 | 2031us | 1156us | **-43%** |
+| n_mats=32 n=512  | 1019us | 983us  | -4% |
+
+The win shrinks as expert count drops (32-expert cases are within noise);
+the prepass replaces a per-workgroup full-ids rescan, so it pays off when
+n_as and the token count are large. Decode (n=1) is the big winner - this
+is the MoE decode path. Correctness: both configs pass 19003/19003.
