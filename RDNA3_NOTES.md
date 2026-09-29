@@ -254,7 +254,12 @@ Findings, in order:
    measured live), so it slipped through. Stores AND restores are now
    gated on `!llama_model_is_hybrid()` (fail-closed; null model also
    skips): dense keeps the feature, hybrids behave exactly as pre-rebase.
-   Root-causing hybrid recurrent restore remains open work.
+   Corruption axis nailed down by elimination: gemma-4-26B-A4B (MoE with
+   dense attention, Q4_K, 26B) restores BIT-IDENTICALLY (194/194 chars,
+   1585/1586 cached) - so it is not MoE, size, or quant related. Only
+   SSM/recurrent state is implicated (speculative decoding was never
+   enabled in any run, ruling out the MTP draft). Root-causing hybrid
+   recurrent restore remains open work.
 5. Mid-prompt stores stay dormant for PART models by upstream design
    (checkpoint gate needs FULL/RS/SWA) - same as pre-rebase. The deferred
    in-memory ring still benefits warm slots on hybrids; only SSD
