@@ -4406,12 +4406,13 @@ private:
                                     // was restored for this task (!ssd_restored_this_task)
                                     // and the gate above shows live state still covers the
                                     // LCP. Restricted to pure-extension turns
-                                    // (has_new_tokens) so only genuinely new tokens are
-                                    // evaluated and no cached token is re-decoded (the
-                                    // recurrent transition is not idempotent, unlike
-                                    // attention KV overwrite). Exact replays keep the
-                                    // forced reset below: TAG_PROMPT_LOGITS would still
-                                    // force a 1-token re-decode of cached state there.
+                                    // (has_new_tokens): continuing in place then evaluates
+                                    // only genuinely new tokens. Exact replays keep the
+                                    // forced reset below — measured 2026-10-08: replay
+                                    // re-decodes drift with history length (virgin slots
+                                    // are bit-identical, consecutive replays differ), consistent
+                                    // with single-snapshot (K=1) rollback coverage over growing
+                                    // history. Replay reuse needs deeper rollback work first.
                                     const bool hybrid_slot_pre = model_tgt &&
                                         (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt));
                                     const bool live_reuse = hybrid_slot_pre && !ssd_restored_this_task && has_new_tokens;
