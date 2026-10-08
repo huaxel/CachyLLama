@@ -247,13 +247,19 @@ struct common_speculative_impl {
         }
     }
 
-    // effective draft length for this step, never above the configured n_max
+    // effective draft length for this step, never above the configured n_max.
+    // One-sided throttle: when the estimate is within one token of n_max, draft
+    // the full width. Throttling 6->5 on predictable content saves one cheap draft
+    // pass but yields ~one fewer accepted token per verify round, and the extra
+    // target forwards cost more than the saved drafts (measured -13% decode on
+    // repetitive content). Throttle only when clearly unpredictable.
     int32_t adaptive_n_draft(llama_seq_id seq_id, int32_t n_cfg, int32_t n_min) {
         if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= acc_ema.size()) {
             return n_cfg;
         }
         const int32_t n_want = (int32_t) std::lround(acc_ema[seq_id]);
-        const int32_t n      = std::max(std::max(1, n_min), std::min(n_cfg, n_want));
+        const int32_t floor  = std::max(1, n_min);
+        const int32_t n      = n_want >= n_cfg - 1 ? n_cfg : std::max(floor, std::min(n_cfg, n_want));
         acc_ema[seq_id]      = std::min(acc_ema[seq_id], (float) n_cfg); // do not let the probe run away
         n_last_draft[seq_id] = n;
         return n;
