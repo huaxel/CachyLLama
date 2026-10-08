@@ -2,6 +2,28 @@
 
 CachyLLama diverges from `upstream/master` by carrying third-party work. Re-evaluate this table when upstream merges or upstream PRs close — row status changes weekly.
 
+## 2026-10-08 sync (`upstream/master` 9c2e0e491)
+
+Dropped as superseded (no table rows — none existed for them):
+
+- qwen4exp MTP loader/graph carry (bool-ctor base, hand-rolled `block_count`/`ratios`/
+  converter MTP hack): upstream now ships MTP support end to end (`no_build` base,
+  `_MTP_EXTRA` converter mapping, `load_block` trunk/mtp flags). Fork keeps only its
+  MTP-only-file fallback (`trunk_flags = TENSOR_NOT_REQUIRED` when the trunk is absent).
+- QSA decode-gather carry (`build_attn_qsa_gather`, `qsa_inps`): dead declarations
+  referencing the removed `llm_graph_input_qsa` type; upstream's k-pool indexer covers
+  the path. Removed.
+- Recurrent snapshot shift-register (`build_rs` caller): uncompilable against upstream's
+  redesigned snapshot inputs (`s_copy_tail` + callee-side extra-state copy). Dropped;
+  single-sequence rollback re-validated bit-exact post-merge (Qwen3.5-0.8B warm append).
+  Note: `test-recurrent-state-rollback` multi-seq split-replay subtest fails on pristine
+  upstream 9c2e0e491 too (earlier, at full-logits position 6) — upstream breakage, not a
+  fork regression.
+- Doc drift found during the sync: `GGML_VK_NO_FA_SCRATCH_TRANSPOSE`,
+  `GGML_VK_FA_SCRATCH_SAFETY_MB`, `GGML_VK_FA_SCRATCH_FORCE` are named below but no
+  code reads them; concat-transpose dispatch is wired default-ON (commit 5d5b67444),
+  not unwired as tabled. Rows need a refresh pass.
+
 **Convention:**
 - "Merged upstream" — drop our copy on the next upstream merge.
 - "Not upstreamed" — keep carrying; re-check upstream status each merge.
