@@ -1986,7 +1986,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
         // from the raw output before giving up. This ensures the client
         // always receives the model's response -- including structured
         // tool calls -- even when the PEG parser can't fully match.
-        common_chat_msg msg = salvage_peg_native_output(input, params);
+        common_chat_msg msg = salvage_peg_native_output(input.text, params);
         sanitize_dsml_content(msg.content);
         for (auto & part : msg.content_parts) {
             sanitize_dsml_content(part.text);
