@@ -4145,8 +4145,25 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
+                                    // Live-frontier fast path (hybrid/recurrent): no snapshot
+                                    // was restored for this task (!ssd_restored_this_task)
+                                    // and the gate above shows live state still covers the
+                                    // LCP. Restricted to pure-extension turns
+                                    // (has_new_tokens) so only genuinely new tokens are
+                                    // evaluated and no cached token is re-decoded (the
+                                    // recurrent transition is not idempotent, unlike
+                                    // attention KV overwrite). Exact replays keep the
+                                    // forced reset below: TAG_PROMPT_LOGITS would still
+                                    // force a 1-token re-decode of cached state there.
+                                    const bool hybrid_slot_pre = model_tgt &&
+                                        (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt));
+                                    const bool live_reuse = hybrid_slot_pre && !ssd_restored_this_task && has_new_tokens;
+                                    if (live_reuse) {
+                                        SLT_DBG(slot, "[PROBE] live-reuse n_past=%d (hybrid, intact live state, skipping ckpt load/reset)\n",
+                                                n_past);
+                                    }
                                     // search for a context checkpoint
-                                    const auto it = std::find_if(
+                                    const auto it = live_reuse ? slot.prompt.checkpoints.rend() : std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
                                         [&](const auto & cur) {
@@ -4169,6 +4186,9 @@ private:
                                     );
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
+                                    if (live_reuse) {
+                                        do_reset = false;
+                                    }
                                     // Recurrent/hybrid slots never reuse RAM checkpoints:
                                     // the exclusive recount (n_past from size_up_to_pos)
                                     // drops the last cached token, whose re-decode
@@ -4178,13 +4198,12 @@ private:
                                     // the sequence so prefill starts from clean state.
                                     // (SSD cold restores are unaffected: they set n_past
                                     // directly and skip this block.)
-                                    const bool hybrid_slot = model_tgt &&
-                                        (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt));
-                                    if (hybrid_slot) {
+                                    const bool hybrid_slot = hybrid_slot_pre;
+                                    if (hybrid_slot && !live_reuse) {
                                         do_reset = true;
                                     }
 
-                                    if (!do_reset) {
+                                    if (!do_reset && !live_reuse) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
